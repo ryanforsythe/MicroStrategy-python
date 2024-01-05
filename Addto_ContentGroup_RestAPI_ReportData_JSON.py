@@ -10,8 +10,6 @@ import pandas as pd
 serverName = '.cloud.microstrategy.com'
 userName=''
 pwd=''
-projectID = '92F117EF491CF3D633AB7982C831B065'
-projectGUID = '92F117EF491CF3D633AB7982C831B065' #Source Dossier Project
 projectName = ''
 plaProjectName ='Platform Analytics'
 contentGroupID = '2A5B949544E2BE6511CCC898867F42A5'
