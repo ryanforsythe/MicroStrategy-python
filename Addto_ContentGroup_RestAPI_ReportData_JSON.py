@@ -11,18 +11,16 @@ serverName = '.cloud.microstrategy.com'
 userName=''
 pwd=''
 projectName = ''
-plaProjectName ='Platform Analytics'
 contentGroupID = '2A5B949544E2BE6511CCC898867F42A5'
 #userName=input("User Name:")
 #pwd=input("Password:")
 
 api_url = 'https://' + serverName + '/MicroStrategyLibrary/api'
-mstrAuth = {"username": userName, "password": pwd,"loginMode": 1, "maxSearch": 3}
 
 plaURL = api_url
 plauserName = userName
 plapwd = pwd
-plaReportGUID=''
+plaProjectName ='Platform Analytics'
 
 """
 dossierList = ["3E63CD1649B024748831059FA28E7FB6"
@@ -64,7 +62,7 @@ def MSTRProject_api(api_url, headers_svr, cookies, proj_name):
 
 #Get Platform Analytics Data
 authToken, cookies, headers_svr = login(plaURL,plauserName,plapwd)
-projectGUID, headers_prj = MSTRProject_api(plaURL, headers_svr, cookies, proj_name)    
+projectGUID, headers_prj = MSTRProject_api(plaURL, headers_svr, cookies, plaProjectName)    
 
 
 
