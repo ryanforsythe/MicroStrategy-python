@@ -6,7 +6,6 @@ import csv
 from IPython.display import display
 import pandas as pd
 from pandas import option_context, DataFrame
-from openpyxl import Workbook
 
 
 serverName = '.cloud.microstrategy.com'
@@ -80,7 +79,7 @@ df = pd.read_excel(xlsx_file)
 display(df)
 
 #Adjust for Excel input
-objectGUIDList = df['GUID']
+objectGUIDList = df['Object GUID']
 display (objectGUIDList)
 
 payload = {'folderId': targetFolderGUID}
