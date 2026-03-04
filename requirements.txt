@@ -1,0 +1,25 @@
+# MicroStrategy Python Management Scripts — Dependencies
+
+# MicroStrategy SDK
+mstrio-py
+
+# HTTP client (REST API calls)
+requests
+
+# Data manipulation & output
+pandas
+openpyxl       # Excel read/write (.xlsx)
+
+# JSON querying (REST API responses)
+jmespath
+
+# Logging
+loguru
+
+# Environment variable / .env file support
+python-dotenv
+
+# OS keyring integration (optional — for password-free .env files)
+# Enables storing credentials in Windows Credential Manager / macOS Keychain / SecretService.
+# If not installed, MstrConfig falls back to MSTR_*_PASSWORD env vars only.
+# keyring
