@@ -345,7 +345,7 @@ from mstrio.types import ObjectTypes, ObjectSubTypes
 | `UpdateMetric_ReportDataSource_ChangeSet.py` | REST API + Changeset | Update metric data source via changeset |
 | `ExportUsers.py` | mstrio-py + mstrio_core | Export all users → CSV (GUID, login ID, trust ID, group membership JSON) |
 | `CompareServerSettings.py` | mstrio-py + mstrio_core | Compare, export, or apply I-Server settings across environments (dev/qa/prod) |
-| `ExpireSchedules.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; renames orphans to "DEPRECATE-" prefix |
+| `ExpireSchedules.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; uses `list_related_subscriptions(to_dictionary=True)` to count subscriptions (active/inactive when API exposes it); renames zero-subscription orphans to "DEPRECATE-" prefix |
 
 ## Known Gaps / Improvement Areas
 

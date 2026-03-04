@@ -2,7 +2,7 @@
 ExpireSchedules.py — Set the stop_date to today for any schedule whose
 stop_date is either NULL (runs forever) or in the future (> today).
 
-Additionally, if a schedule has no dependents, it is renamed to
+Additionally, if a schedule has no related subscriptions, it is renamed to
 "DEPRECATE-<original name>" to flag it as an orphan.
 
 Schedules whose stop_date is already in the past are already expired and
@@ -33,12 +33,20 @@ from mstrio_core.config import MstrEnvironment
 ENVS = [e.value for e in MstrEnvironment]
 DEPRECATE_PREFIX = "DEPRECATE-"
 OUTPUT_FILENAME = "expired_schedules.csv"
+
+# Candidate field names that indicate an active/enabled subscription.
+# The mstrio-py Subscription object does not expose an active flag directly;
+# these are checked against the raw dict returned by to_dictionary=True.
+_ACTIVE_FIELD_CANDIDATES = ("active", "enabled", "isActive", "is_active")
+
 COLUMNS = [
     "id",
     "name",
     "schedule_type",
     "current_stop_date",
-    "has_dependents",
+    "subscription_count",
+    "active_subscriptions",
+    "inactive_subscriptions",
     "actions",
 ]
 
@@ -64,21 +72,68 @@ def _to_date(value) -> date | None:
     return None
 
 
-def _check_dependents(schedule) -> bool:
+def _get_subscriptions(schedule) -> list[dict]:
     """
-    Call has_dependents() on a schedule.  Returns True on any error so that
-    a failed check never causes an accidental rename.
+    Return all subscriptions dependent on *schedule* as raw dicts.
+
+    Uses to_dictionary=True so we get the full REST API payload, which may
+    include fields (e.g. 'active') that the Subscription Python object does
+    not expose as properties.
+
+    Returns an empty list on any error so that a failed lookup never causes
+    an accidental rename.
     """
     try:
-        return schedule.has_dependents()
+        return schedule.list_related_subscriptions(to_dictionary=True)
     except Exception as exc:
         logger.warning(
-            "Could not check dependents for {name} ({id}) — assuming True: {exc}",
+            "Could not list subscriptions for {name} ({id}) — assuming has "
+            "dependents to prevent accidental rename: {exc}",
             name=schedule.name,
             id=schedule.id,
             exc=exc,
         )
-        return True
+        # Return a sentinel so the caller treats this as "has dependents".
+        return [{}]
+
+
+def _active_field(sub_dicts: list[dict]) -> str | None:
+    """
+    Detect which field name (if any) carries the active/enabled flag.
+    Inspects the first non-empty dict and returns the first matching
+    candidate field name, or None if none are found.
+    """
+    for d in sub_dicts:
+        if not d:
+            continue
+        for candidate in _ACTIVE_FIELD_CANDIDATES:
+            if candidate in d:
+                return candidate
+    return None
+
+
+def _categorize_subscriptions(
+    sub_dicts: list[dict],
+) -> tuple[int, int | None, int | None]:
+    """
+    Return (total, active, inactive).
+
+    *active* and *inactive* are None when no active/enabled field can be
+    found in the raw subscription dicts (i.e. the API does not expose it).
+    """
+    total = len(sub_dicts)
+    if total == 0:
+        return 0, 0, 0
+
+    field = _active_field(sub_dicts)
+    if field is None:
+        return total, None, None
+
+    active = sum(
+        1 for d in sub_dicts
+        if d.get(field) in (True, 1, "true", "True", "ACTIVE", "active")
+    )
+    return total, active, total - active
 
 
 def _deprecate_name(name: str) -> str:
@@ -86,6 +141,11 @@ def _deprecate_name(name: str) -> str:
     if name.startswith(DEPRECATE_PREFIX):
         return name
     return DEPRECATE_PREFIX + name
+
+
+def _fmt_count(value: int | None) -> str:
+    """Format an optional count for CSV output."""
+    return str(value) if value is not None else "N/A"
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -120,6 +180,7 @@ def main(
         )
 
         # ── Scan: identify schedules in scope ─────────────────────────────────
+        # Each entry: (schedule, stop_date, sub_dicts, total, active, inactive)
         in_scope = []
         skipped = 0
 
@@ -130,8 +191,30 @@ def main(
                 skipped += 1
                 continue
 
-            has_deps = _check_dependents(s)
-            in_scope.append((s, stop, has_deps))
+            sub_dicts = _get_subscriptions(s)
+            total, active, inactive = _categorize_subscriptions(sub_dicts)
+
+            # Log per-schedule subscription detail
+            if active is not None:
+                logger.debug(
+                    "  {name} ({id}): {total} subscription(s) — "
+                    "{active} active, {inactive} inactive",
+                    name=s.name,
+                    id=s.id,
+                    total=total,
+                    active=active,
+                    inactive=inactive,
+                )
+            else:
+                logger.debug(
+                    "  {name} ({id}): {total} subscription(s) "
+                    "(active/inactive status not available from API)",
+                    name=s.name,
+                    id=s.id,
+                    total=total,
+                )
+
+            in_scope.append((s, stop, sub_dicts, total, active, inactive))
 
         logger.info(
             "{n} schedule(s) in scope | {s} already expired (skipped).",
@@ -139,11 +222,21 @@ def main(
             s=skipped,
         )
 
+        # Summary: did the API expose active/inactive?
+        if in_scope:
+            sample_total, sample_active, _ = in_scope[0][3], in_scope[0][4], None
+            if sample_active is None and sample_total > 0:
+                logger.info(
+                    "Note: active/inactive subscription status is not available "
+                    "from the REST API for this server version — "
+                    "subscription_count only."
+                )
+
         # ── Build CSV rows ────────────────────────────────────────────────────
         rows = []
-        for s, stop, has_deps in in_scope:
+        for s, stop, sub_dicts, total, active, inactive in in_scope:
             actions = [f"set stop_date={today_str}"]
-            if not has_deps:
+            if total == 0:
                 actions.append(f"rename → {_deprecate_name(s.name)!r}")
 
             rows.append([
@@ -151,7 +244,9 @@ def main(
                 s.name,
                 str(getattr(s, "schedule_type", "")),
                 str(stop) if stop else "",
-                str(has_deps),
+                str(total),
+                _fmt_count(active),
+                _fmt_count(inactive),
                 "; ".join(actions),
             ])
 
@@ -178,9 +273,9 @@ def main(
         renamed = 0
         errors = 0
 
-        for s, stop, has_deps in in_scope:
+        for s, stop, sub_dicts, total, active, inactive in in_scope:
             alter_kwargs: dict = {"stop_date": today_str}
-            if not has_deps:
+            if total == 0:
                 alter_kwargs["name"] = _deprecate_name(s.name)
 
             try:
@@ -195,7 +290,17 @@ def main(
                     )
                     renamed += 1
                 else:
-                    logger.info("Expired: {name} ({id})", name=s.name, id=s.id)
+                    sub_detail = (
+                        f"{total} subscription(s)"
+                        if active is None
+                        else f"{total} subscription(s): {active} active, {inactive} inactive"
+                    )
+                    logger.info(
+                        "Expired: {name} ({id}) — {detail}",
+                        name=s.name,
+                        id=s.id,
+                        detail=sub_detail,
+                    )
 
                 expired += 1
 
@@ -229,8 +334,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Expire MicroStrategy schedules with no stop_date or a future "
-            "stop_date.  Orphaned schedules (no dependents) are also renamed "
-            f"with a '{DEPRECATE_PREFIX}' prefix."
+            "stop_date.  Orphaned schedules (no related subscriptions) are also "
+            f"renamed with a '{DEPRECATE_PREFIX}' prefix."
         )
     )
     parser.add_argument(
