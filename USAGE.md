@@ -253,7 +253,9 @@ python ExpireSchedules.py dev --output-dir c:/reports/schedules
 | `name` | Current schedule name |
 | `schedule_type` | Schedule type (time-based, event-based, etc.) |
 | `current_stop_date` | Existing stop date (blank = no stop date set) |
-| `has_dependents` | `True` / `False` — whether other objects depend on this schedule |
+| `subscription_count` | Total number of subscriptions that reference this schedule |
+| `active_subscriptions` | Number of active subscriptions, or `N/A` if the server does not expose that field |
+| `inactive_subscriptions` | Number of inactive subscriptions, or `N/A` if the server does not expose that field |
 | `actions` | Comma-separated list of changes that will be (or were) applied |
 
 ---
