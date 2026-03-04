@@ -1,17 +1,17 @@
 """
-CompareServerSettings.py — Compare, export, or apply MicroStrategy I-Server
+ServerSettingsCompare.py — Compare, export, or apply MicroStrategy I-Server
 settings across environments (dev, qa, prod).
 
 Usage:
-    python CompareServerSettings.py compare <source> <target>  [--format csv|json] [--all]
-    python CompareServerSettings.py export  <env>              [--format csv|json] [--description]
-    python CompareServerSettings.py apply   <source> <target>
+    python ServerSettingsCompare.py compare <source> <target>  [--format csv|json] [--all]
+    python ServerSettingsCompare.py export  <env>              [--format csv|json] [--description]
+    python ServerSettingsCompare.py apply   <source> <target>
 
 Examples:
-    python CompareServerSettings.py compare dev prod
-    python CompareServerSettings.py compare dev prod --format json --all
-    python CompareServerSettings.py export  qa  --format json --description
-    python CompareServerSettings.py apply   dev prod
+    python ServerSettingsCompare.py compare dev prod
+    python ServerSettingsCompare.py compare dev prod --format json --all
+    python ServerSettingsCompare.py export  qa  --format json --description
+    python ServerSettingsCompare.py apply   dev prod
 
 Operations
 ──────────

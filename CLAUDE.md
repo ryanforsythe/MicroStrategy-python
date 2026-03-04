@@ -343,9 +343,10 @@ from mstrio.types import ObjectTypes, ObjectSubTypes
 | `Addto_ContentGroup_RestAPI_ReportData_JSON.py` | REST API | Add dossiers to content groups |
 | `ShortcutCreateFromExcel.py` | REST API | Create shortcuts from Excel GUID list |
 | `UpdateMetric_ReportDataSource_ChangeSet.py` | REST API + Changeset | Update metric data source via changeset |
-| `ExportUsers.py` | mstrio-py + mstrio_core | Export all users → CSV (GUID, login ID, trust ID, group membership JSON) |
-| `CompareServerSettings.py` | mstrio-py + mstrio_core | Compare, export, or apply I-Server settings across environments (dev/qa/prod) |
-| `ExpireSchedules.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; uses `list_related_subscriptions(to_dictionary=True)` to count subscriptions (active/inactive when API exposes it); renames zero-subscription orphans to "DEPRECATE-" prefix |
+| `UsersExport.py` | mstrio-py + mstrio_core | Export all users → CSV (GUID, login ID, trust ID, group membership JSON) |
+| `ServerSettingsCompare.py` | mstrio-py + mstrio_core | Compare, export, or apply I-Server settings across environments (dev/qa/prod) |
+| `SchedulesExpire.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; uses `list_related_subscriptions(to_dictionary=True)` to count subscriptions (active/inactive when API exposes it); renames zero-subscription orphans to "DEPRECATE-" prefix |
+| `SchedulesActivate.py` | mstrio-py + mstrio_core | Clear stop_date for schedules whose stop_date falls within a given date range (YYYY-MM-DD to YYYY-MM-DD, inclusive); optionally restores "DEPRECATE-" prefixed names set by SchedulesExpire.py |
 
 ## Known Gaps / Improvement Areas
 
