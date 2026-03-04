@@ -1,5 +1,5 @@
 """
-ExportUsers.py — Export all MicroStrategy users from a server to CSV.
+UsersExport.py — Export all MicroStrategy users from a server to CSV.
 
 Output columns:
     base_url         – Environment URL (for traceability)
@@ -10,10 +10,10 @@ Output columns:
     group_membership – JSON array: [{"id": "...", "name": "..."}, ...]
 
 Usage:
-    python ExportUsers.py <env>  [--output-dir PATH]
+    python UsersExport.py <env>  [--output-dir PATH]
 
-    python ExportUsers.py dev
-    python ExportUsers.py prod --output-dir c:/reports
+    python UsersExport.py dev
+    python UsersExport.py prod --output-dir c:/reports
 
 Performance note:
     Accessing user.memberships may trigger a separate API call per user in some

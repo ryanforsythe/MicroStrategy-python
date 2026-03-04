@@ -16,9 +16,10 @@ extraction, and content-group operations.
    - [Credential storage options](#credential-storage-options)
    - [Environment variable reference](#environment-variable-reference)
 4. [CLI Scripts](#cli-scripts)
-   - [ExportUsers.py](#exportuserspy)
-   - [ExpireSchedules.py](#expireschedulespyy)
-   - [CompareServerSettings.py](#compareserversettingspy)
+   - [UsersExport.py](#usersexportpy)
+   - [SchedulesExpire.py](#schedulesexpirepy)
+   - [SchedulesActivate.py](#schedulesactivatepy)
+   - [ServerSettingsCompare.py](#serversettingscomparepy)
 5. [Legacy Scripts](#legacy-scripts)
 6. [Output Files](#output-files)
 7. [Logging](#logging)
@@ -104,8 +105,8 @@ MSTR_{ENV}_{SETTING}  →  MSTR_{SETTING}  →  built-in default
 For example, when `MSTR_ENV=qa`, `MSTR_QA_BASE_URL` is used before
 `MSTR_BASE_URL`.
 
-The CLI scripts (`ExportUsers.py`, `ExpireSchedules.py`,
-`CompareServerSettings.py`) override `MSTR_ENV` at runtime by constructing
+The CLI scripts (`UsersExport.py`, `SchedulesExpire.py`, `SchedulesActivate.py`,
+`ServerSettingsCompare.py`) override `MSTR_ENV` at runtime by constructing
 `MstrConfig(environment=MstrEnvironment(env))` from the environment argument
 you pass on the command line — so the `.env`-level `MSTR_ENV` does not need
 to match for those scripts.
@@ -165,7 +166,7 @@ arguments. Run any script with `--help` for the full option list.
 
 ---
 
-### ExportUsers.py
+### UsersExport.py
 
 Export all MicroStrategy users from an environment to a CSV file.
 
@@ -175,7 +176,7 @@ Export all MicroStrategy users from an environment to a CSV file.
 #### Usage
 
 ```
-python ExportUsers.py <env> [--output-dir PATH]
+python UsersExport.py <env> [--output-dir PATH]
 ```
 
 | Argument | Required | Description |
@@ -187,10 +188,10 @@ python ExportUsers.py <env> [--output-dir PATH]
 
 ```bash
 # Export users from dev (output → c:/tmp/users_export.csv)
-python ExportUsers.py dev
+python UsersExport.py dev
 
 # Export users from prod to a specific directory
-python ExportUsers.py prod --output-dir c:/reports
+python UsersExport.py prod --output-dir c:/reports
 ```
 
 #### Output file
@@ -199,7 +200,7 @@ python ExportUsers.py prod --output-dir c:/reports
 
 ---
 
-### ExpireSchedules.py
+### SchedulesExpire.py
 
 Set `stop_date = today` on every schedule whose `stop_date` is either **null**
 (runs forever) or **in the future**.  Schedules already expired are left
@@ -217,7 +218,7 @@ without modifying the server.  Pass `--apply` to commit the changes.
 #### Usage
 
 ```
-python ExpireSchedules.py <env> [--apply] [--output-dir PATH]
+python SchedulesExpire.py <env> [--apply] [--output-dir PATH]
 ```
 
 | Argument | Required | Description |
@@ -230,15 +231,15 @@ python ExpireSchedules.py <env> [--apply] [--output-dir PATH]
 
 ```bash
 # Step 1 — preview what would change on prod (no server modifications)
-python ExpireSchedules.py prod
+python SchedulesExpire.py prod
 
 # Review c:/tmp/expired_schedules.csv, then:
 
 # Step 2 — apply the changes
-python ExpireSchedules.py prod --apply
+python SchedulesExpire.py prod --apply
 
 # Dry run against dev with a custom output directory
-python ExpireSchedules.py dev --output-dir c:/reports/schedules
+python SchedulesExpire.py dev --output-dir c:/reports/schedules
 ```
 
 #### Output file
@@ -260,16 +261,80 @@ python ExpireSchedules.py dev --output-dir c:/reports/schedules
 
 ---
 
-### CompareServerSettings.py
+### SchedulesActivate.py
+
+Clear the `stop_date` for schedules whose `stop_date` falls within a given
+date range, reactivating those schedules so they resume running.  Pairs with
+`SchedulesExpire.py` — pass `--restore-name` to also reverse the
+`DEPRECATE-` rename applied by that script.
+
+Schedules with no `stop_date`, or whose `stop_date` is outside the range,
+are left untouched.
+
+**Safety default — dry run:** The script previews changes and writes a CSV
+without modifying the server.  Pass `--apply` to commit the changes.
+
+#### Usage
+
+```
+python SchedulesActivate.py <env> <start_date> <end_date>
+                            [--apply] [--restore-name] [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to process: `dev`, `qa`, or `prod` |
+| `start_date` | Yes | Earliest `stop_date` to match (YYYY-MM-DD, inclusive) |
+| `end_date` | Yes | Latest `stop_date` to match (YYYY-MM-DD, inclusive). Use the same value as `start_date` to target a single date |
+| `--apply` | No | Apply changes to the server (default: dry run — preview only) |
+| `--restore-name` | No | Strip the `DEPRECATE-` prefix from schedule names when activating |
+| `--output-dir PATH` | No | Directory for the output CSV (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+#### Examples
+
+```bash
+# Preview schedules that expired on or between two dates (no server changes)
+python SchedulesActivate.py dev 2025-03-01 2025-03-31
+
+# Target a single specific date
+python SchedulesActivate.py dev 2025-03-04 2025-03-04
+
+# Apply — clear stop_date for all matches
+python SchedulesActivate.py prod 2025-03-01 2025-03-31 --apply
+
+# Apply and restore DEPRECATE- names at the same time
+python SchedulesActivate.py prod 2025-03-01 2025-03-31 --apply --restore-name
+```
+
+#### Output file
+
+`<output-dir>/activated_schedules.csv`
+
+**CSV columns:**
+
+| Column | Description |
+|---|---|
+| `id` | Schedule GUID |
+| `name` | Current schedule name |
+| `schedule_type` | Schedule type (time-based, event-based, etc.) |
+| `current_stop_date` | The stop date that will be cleared |
+| `subscription_count` | Total number of subscriptions that reference this schedule |
+| `active_subscriptions` | Number of active subscriptions, or `N/A` if the server does not expose that field |
+| `inactive_subscriptions` | Number of inactive subscriptions, or `N/A` if the server does not expose that field |
+| `actions` | Comma-separated list of changes that will be (or were) applied |
+
+---
+
+### ServerSettingsCompare.py
 
 Compare, export, or apply MicroStrategy I-Server settings across environments.
 
 #### Subcommands
 
 ```
-python CompareServerSettings.py compare <source> <target>  [--format csv|json] [--all]
-python CompareServerSettings.py export  <env>              [--format csv|json] [--description]
-python CompareServerSettings.py apply   <source> <target>  [--output-dir PATH]
+python ServerSettingsCompare.py compare <source> <target>  [--format csv|json] [--all]
+python ServerSettingsCompare.py export  <env>              [--format csv|json] [--description]
+python ServerSettingsCompare.py apply   <source> <target>  [--output-dir PATH]
 ```
 
 ---
@@ -290,13 +355,13 @@ identical rows as well.
 
 ```bash
 # Compare dev vs prod, CSV output (diff rows only)
-python CompareServerSettings.py compare dev prod
+python ServerSettingsCompare.py compare dev prod
 
 # Compare dev vs prod, JSON output, include all rows
-python CompareServerSettings.py compare dev prod --format json --all
+python ServerSettingsCompare.py compare dev prod --format json --all
 
 # Compare qa vs prod with a custom output directory
-python CompareServerSettings.py compare qa prod --output-dir c:/reports
+python ServerSettingsCompare.py compare qa prod --output-dir c:/reports
 ```
 
 **Output file:** `<output-dir>/server_settings_diff_<source>_vs_<target>.<fmt>`
@@ -316,13 +381,13 @@ Fetches I-Server settings from a single environment and writes them to a file.
 
 ```bash
 # Export dev settings to CSV
-python CompareServerSettings.py export dev
+python ServerSettingsCompare.py export dev
 
 # Export QA settings to JSON
-python CompareServerSettings.py export qa --format json
+python ServerSettingsCompare.py export qa --format json
 
 # Export prod settings with descriptions
-python CompareServerSettings.py export prod --description
+python ServerSettingsCompare.py export prod --description
 ```
 
 **Output file:** `<output-dir>/server_settings_<env>.<fmt>`
@@ -345,10 +410,10 @@ Copies I-Server settings from the source environment to the target server.
 
 ```bash
 # Copy dev settings to QA (will prompt for confirmation)
-python CompareServerSettings.py apply dev qa
+python ServerSettingsCompare.py apply dev qa
 
 # Copy dev settings to prod with a custom snapshot directory
-python CompareServerSettings.py apply dev prod --output-dir c:/reports/snapshots
+python ServerSettingsCompare.py apply dev prod --output-dir c:/reports/snapshots
 ```
 
 **Files written:**

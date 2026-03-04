@@ -1,5 +1,5 @@
 """
-ExpireSchedules.py — Set the stop_date to today for any schedule whose
+SchedulesExpire.py — Set the stop_date to today for any schedule whose
 stop_date is either NULL (runs forever) or in the future (> today).
 
 Additionally, if a schedule has no related subscriptions, it is renamed to
@@ -9,10 +9,10 @@ Schedules whose stop_date is already in the past are already expired and
 are left untouched.
 
 Usage:
-    python ExpireSchedules.py <env>  [--apply]  [--output-dir PATH]
+    python SchedulesExpire.py <env>  [--apply]  [--output-dir PATH]
 
-    python ExpireSchedules.py dev                  # dry run — preview only
-    python ExpireSchedules.py prod --apply         # apply changes to prod
+    python SchedulesExpire.py dev                  # dry run — preview only
+    python SchedulesExpire.py prod --apply         # apply changes to prod
 
 Run without --apply first to review the CSV output, then re-run with
 --apply to commit the changes.
