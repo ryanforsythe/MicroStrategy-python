@@ -347,6 +347,7 @@ from mstrio.types import ObjectTypes, ObjectSubTypes
 | `ServerSettingsCompare.py` | mstrio-py + mstrio_core | Compare, export, or apply I-Server settings across environments (dev/qa/prod) |
 | `SchedulesExpire.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; uses `list_related_subscriptions(to_dictionary=True)` to count subscriptions (active/inactive when API exposes it); renames zero-subscription orphans to "DEPRECATE-" prefix |
 | `SchedulesActivate.py` | mstrio-py + mstrio_core | Clear stop_date for schedules whose stop_date falls within a given date range (YYYY-MM-DD to YYYY-MM-DD, inclusive); optionally restores "DEPRECATE-" prefixed names set by SchedulesExpire.py |
+| `UserGroups.py` | mstrio-py + mstrio_core | Audit, export, and document user groups. Subcommands: `audit` (empty groups + directly-assigned privileges → separate files), `export` (all groups with members + privileges), `privileges` (direct privileges only, inherited excluded), `members` (direct members; `--resolve` for recursive effective-user expansion). All subcommands support `--format csv\|json`. |
 
 ## Known Gaps / Improvement Areas
 

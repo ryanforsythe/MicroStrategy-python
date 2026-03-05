@@ -20,6 +20,7 @@ extraction, and content-group operations.
    - [SchedulesExpire.py](#schedulesexpirepy)
    - [SchedulesActivate.py](#schedulesactivatepy)
    - [ServerSettingsCompare.py](#serversettingscomparepy)
+   - [UserGroups.py](#usergroupspy)
 5. [Legacy Scripts](#legacy-scripts)
 6. [Output Files](#output-files)
 7. [Logging](#logging)
@@ -421,6 +422,222 @@ python ServerSettingsCompare.py apply dev prod --output-dir c:/reports/snapshots
 | File | Description |
 |---|---|
 | `<output-dir>/server_settings_<target>_BEFORE.csv` | Pre-apply snapshot of the target (audit trail) |
+
+---
+
+### UserGroups.py
+
+Audit, export, and document MicroStrategy user groups.
+
+#### Subcommands
+
+```
+python UserGroups.py audit      <env>  [--format csv|json] [--output-dir PATH]
+python UserGroups.py export     <env>  [--format csv|json] [--output-dir PATH]
+python UserGroups.py privileges <env>  [--format csv|json] [--output-dir PATH]
+python UserGroups.py members    <env>  [--format csv|json] [--resolve]
+                                       [--output-dir PATH]
+```
+
+---
+
+#### `audit` — identify empty groups and privileged groups
+
+Scans all user groups and writes **two separate output files**:
+
+- **Empty groups** — groups with zero direct members.
+- **Privileged groups** — groups with one or more privileges directly assigned
+  to the group object (inherited privileges are excluded).
+
+Groups outside both categories produce no output file for that category.
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to audit: `dev`, `qa`, or `prod` |
+| `--format csv\|json` | No | Output format (default: `csv`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+# Audit dev — writes CSV files for empty and privileged groups
+python UserGroups.py audit dev
+
+# Audit prod in JSON format
+python UserGroups.py audit prod --format json
+
+# Audit QA with a custom output directory
+python UserGroups.py audit qa --output-dir c:/reports/groups
+```
+
+**Output files:**
+
+| File | Contents |
+|---|---|
+| `<output-dir>/user_groups_audit_empty.csv` (or `.json`) | Groups with no direct members |
+| `<output-dir>/user_groups_audit_privileged.csv` (or `.json`) | Groups with directly-assigned privileges |
+
+**CSV columns — empty groups:**
+
+| Column | Description |
+|---|---|
+| `id` | Group GUID |
+| `name` | Group display name |
+| `description` | Group description |
+
+**CSV columns — privileged groups:**
+
+| Column | Description |
+|---|---|
+| `id` | Group GUID |
+| `name` | Group display name |
+| `description` | Group description |
+| `privilege_count` | Number of directly-assigned privileges |
+| `privilege_names` | Semicolon-separated list of privilege names |
+
+---
+
+#### `export` — export all groups with members and privileges
+
+Exports every group with its direct members and directly-assigned privileges
+in a single file.  Useful as a full snapshot of the group directory.
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to export: `dev`, `qa`, or `prod` |
+| `--format csv\|json` | No | Output format (default: `json`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+# Export all groups from dev to JSON (default)
+python UserGroups.py export dev
+
+# Export all groups from prod to CSV
+python UserGroups.py export prod --format csv
+```
+
+**Output file:** `<output-dir>/user_groups_export.json` (or `.csv`)
+
+**JSON structure:**
+
+```json
+[
+  {
+    "id": "...",
+    "name": "Finance Users",
+    "description": "",
+    "member_count": 5,
+    "members": [
+      {"id": "...", "name": "Alice", "type": "user"},
+      {"id": "...", "name": "Sub-Group A", "type": "group"}
+    ],
+    "privilege_count": 2,
+    "privileges": [
+      {"id": "...", "name": "Use Library", "type": "..."},
+      {"id": "...", "name": "Web User", "type": "..."}
+    ]
+  }
+]
+```
+
+**CSV columns:** `id`, `name`, `description`, `member_count`, `members` (JSON string),
+`privilege_count`, `privileges` (JSON string).
+
+---
+
+#### `privileges` — list directly-assigned privileges per group
+
+Lists only the privileges explicitly assigned to each group object.
+Inherited privileges (from roles or parent groups) are excluded.
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to query: `dev`, `qa`, or `prod` |
+| `--format csv\|json` | No | Output format (default: `json`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+# List direct privileges from dev to JSON (default)
+python UserGroups.py privileges dev
+
+# List direct privileges from prod to CSV
+python UserGroups.py privileges prod --format csv
+```
+
+**Output file:** `<output-dir>/user_groups_privileges.json` (or `.csv`)
+
+**JSON structure:** one object per group that has at least one direct privilege,
+with a `privileges` array.
+
+**CSV columns** (one row per privilege, flattened):
+
+| Column | Description |
+|---|---|
+| `group_id` | Group GUID |
+| `group_name` | Group display name |
+| `group_description` | Group description |
+| `priv_id` | Privilege GUID |
+| `priv_name` | Privilege name |
+| `priv_type` | Privilege type |
+
+---
+
+#### `members` — list group members
+
+Lists the members of every group.  By default returns **direct members only**
+(both users and nested subgroups).  Pass `--resolve` to recursively expand
+all subgroups and return the **effective set of users** (deduplicated).
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to query: `dev`, `qa`, or `prod` |
+| `--format csv\|json` | No | Output format (default: `json`) |
+| `--resolve` | No | Recursively expand subgroups; return effective (deduplicated) users only |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+# Direct members of every group on dev (JSON)
+python UserGroups.py members dev
+
+# Direct members in CSV format
+python UserGroups.py members dev --format csv
+
+# Recursive effective-user resolution on prod
+python UserGroups.py members prod --resolve
+
+# Effective users on QA, CSV output
+python UserGroups.py members qa --resolve --format csv
+```
+
+**Output files:**
+
+| Mode | File |
+|---|---|
+| Direct (default) | `<output-dir>/user_groups_members_direct.json` (or `.csv`) |
+| Resolved (`--resolve`) | `<output-dir>/user_groups_members_resolved.json` (or `.csv`) |
+
+**JSON structure (direct):** one object per group with a `members` array
+containing objects with `id`, `name`, and `type` (`"user"` or `"group"`).
+
+**JSON structure (resolved):** one object per group with a `members` array
+containing only user objects (`type` is always `"user"`).
+
+**CSV columns — direct:**
+
+| Column | Description |
+|---|---|
+| `group_id` | Group GUID |
+| `group_name` | Group display name |
+| `member_id` | Member GUID |
+| `member_name` | Member display name |
+| `member_type` | `user` or `group` |
+
+**CSV columns — resolved (`--resolve`):**
+
+| Column | Description |
+|---|---|
+| `group_id` | Group GUID |
+| `group_name` | Group display name |
+| `user_id` | User GUID |
+| `user_name` | User display name |
 
 ---
 
