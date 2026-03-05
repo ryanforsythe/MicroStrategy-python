@@ -48,6 +48,7 @@ import json
 from pathlib import Path
 
 from loguru import logger
+from mstrio.access_and_security.privilege_mode import PrivilegeMode
 from mstrio.users_and_groups import UserGroup, list_user_groups
 
 from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
@@ -57,10 +58,6 @@ from mstrio_core.config import MstrEnvironment
 
 ENVS = [e.value for e in MstrEnvironment]
 DEPRECATE_PREFIX = "DEPRECATE-"
-
-# Candidate field names for the "inherited" flag on a privilege dict.
-# mstrio-py may surface this under different keys across versions.
-_INHERITED_CANDIDATES = ("inherited", "is_inherited", "isInherited")
 
 # ── Column schemas ─────────────────────────────────────────────────────────────
 
@@ -84,34 +81,6 @@ _RESOLVED_CSV_COLS = ["group_id", "group_name", "user_id", "user_name"]
 # ── Privilege helpers ──────────────────────────────────────────────────────────
 
 
-def _priv_is_inherited(priv: dict) -> bool:
-    """
-    Return True if the privilege was inherited rather than directly assigned.
-
-    Checks several candidate field names because mstrio-py's internal
-    representation has varied across versions.  When no known field is found
-    the privilege is treated as direct (returns False) and a debug message is
-    logged so the caller is not silently over-filtered.
-    """
-    for key in _INHERITED_CANDIDATES:
-        if key in priv:
-            val = priv[key]
-            return bool(val) if not isinstance(val, str) else val.lower() == "true"
-
-    # Nested source dict pattern (e.g. {"source": {"type": "INHERITED"}})
-    source = priv.get("source") or {}
-    if isinstance(source, dict):
-        src_type = source.get("type", "")
-        if isinstance(src_type, str) and src_type.upper() == "INHERITED":
-            return True
-
-    logger.debug(
-        "Could not determine inheritance for privilege {name!r} — treating as direct.",
-        name=priv.get("name", priv.get("id", "?")),
-    )
-    return False
-
-
 def _priv_to_dict(priv: dict) -> dict:
     """Normalise a raw privilege dict to a minimal standard shape."""
     return {
@@ -129,8 +98,9 @@ def _list_direct_privileges(group) -> list[dict]:
     not abort the operation.
     """
     try:
-        raw = group.list_privileges(to_dictionary=True) or []
-        return [_priv_to_dict(p) for p in raw if not _priv_is_inherited(p)]
+        df = group.list_privileges(mode=PrivilegeMode.GRANTED, to_dataframe=True)
+        raw = df.to_dict("records") if df is not None and not df.empty else []
+        return [_priv_to_dict(p) for p in raw]
     except Exception as exc:
         logger.warning(
             "Could not list privileges for group {name!r} ({id}): {exc}",
