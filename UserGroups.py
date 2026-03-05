@@ -81,12 +81,18 @@ _RESOLVED_CSV_COLS = ["group_id", "group_name", "user_id", "user_name"]
 # ── Privilege helpers ──────────────────────────────────────────────────────────
 
 
-def _priv_to_dict(priv: dict) -> dict:
-    """Normalise a raw privilege dict to a minimal standard shape."""
+def _priv_to_dict(priv) -> dict:
+    """Normalise a Privilege object to a minimal standard shape.
+
+    Privilege attributes (mstrio-py): id, name, description, categories,
+    is_project_level_privilege.  'categories' is mapped to the 'type' key
+    used throughout this script's output schemas.
+    """
+    cat = getattr(priv, "categories", "") or ""
     return {
-        "id": priv.get("id", ""),
-        "name": priv.get("name", ""),
-        "type": priv.get("type", ""),
+        "id": str(getattr(priv, "id", "")),
+        "name": getattr(priv, "name", ""),
+        "type": ", ".join(cat) if isinstance(cat, (list, tuple)) else str(cat),
     }
 
 
@@ -98,8 +104,7 @@ def _list_direct_privileges(group) -> list[dict]:
     not abort the operation.
     """
     try:
-        df = group.list_privileges(mode=PrivilegeMode.GRANTED, to_dataframe=True)
-        raw = df.to_dict("records") if df is not None and not df.empty else []
+        raw = group.list_privileges(mode=PrivilegeMode.GRANTED, to_dataframe=False) or []
         return [_priv_to_dict(p) for p in raw]
     except Exception as exc:
         logger.warning(
