@@ -82,17 +82,17 @@ _RESOLVED_CSV_COLS = ["group_id", "group_name", "user_id", "user_name"]
 
 
 def _priv_to_dict(priv) -> dict:
-    """Normalise a Privilege object to a minimal standard shape.
+    """Normalise a raw privilege record to a minimal standard shape.
 
-    Privilege attributes (mstrio-py): id, name, description, categories,
-    is_project_level_privilege.  'categories' is mapped to the 'type' key
-    used throughout this script's output schemas.
+    list_privileges(to_dataframe=False) returns a list of dicts:
+        {'privilege': {'id': ..., 'name': ..., 'level': ...}, 'sources': [...]}
+    The nested 'privilege' dict is unwrapped; 'level' is mapped to 'type'.
     """
-    cat = getattr(priv, "categories", "") or ""
+    p = priv.get("privilege", {}) if isinstance(priv, dict) else {}
     return {
-        "id": str(getattr(priv, "id", "")),
-        "name": getattr(priv, "name", ""),
-        "type": ", ".join(cat) if isinstance(cat, (list, tuple)) else str(cat),
+        "id": p.get("id", ""),
+        "name": p.get("name", ""),
+        "type": p.get("level", ""),
     }
 
 
