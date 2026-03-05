@@ -48,7 +48,7 @@ import json
 from pathlib import Path
 
 from loguru import logger
-from mstrio.users_and_groups import UserGroup, list_groups
+from mstrio.users_and_groups import UserGroup, list_user_groups
 
 from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
 from mstrio_core.config import MstrEnvironment
@@ -272,7 +272,7 @@ def cmd_audit(
 
     conn = get_mstrio_connection(config=config)
     try:
-        groups = list_groups(conn)
+        groups = list_user_groups(conn)
         logger.info("Retrieved {n} group(s) from {env}.", n=len(groups), env=env)
 
         empty_rows: list = []
@@ -357,7 +357,7 @@ def cmd_export(
 
     conn = get_mstrio_connection(config=config)
     try:
-        groups = list_groups(conn)
+        groups = list_user_groups(conn)
         logger.info("Retrieved {n} group(s) from {env}.", n=len(groups), env=env)
 
         rows_csv: list = []
@@ -424,7 +424,7 @@ def cmd_privileges(
 
     conn = get_mstrio_connection(config=config)
     try:
-        groups = list_groups(conn)
+        groups = list_user_groups(conn)
         logger.info("Retrieved {n} group(s) from {env}.", n=len(groups), env=env)
 
         rows_csv: list = []
@@ -502,7 +502,7 @@ def cmd_members(
 
     conn = get_mstrio_connection(config=config)
     try:
-        groups = list_groups(conn)
+        groups = list_user_groups(conn)
         logger.info("Retrieved {n} group(s) from {env}.", n=len(groups), env=env)
 
         if resolve:
