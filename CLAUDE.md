@@ -348,6 +348,7 @@ from mstrio.types import ObjectTypes, ObjectSubTypes
 | `SchedulesExpire.py` | mstrio-py + mstrio_core | Set stop_date=today on schedules with no stop_date or a future stop_date; uses `list_related_subscriptions(to_dictionary=True)` to count subscriptions (active/inactive when API exposes it); renames zero-subscription orphans to "DEPRECATE-" prefix |
 | `SchedulesActivate.py` | mstrio-py + mstrio_core | Clear stop_date for schedules whose stop_date falls within a given date range (YYYY-MM-DD to YYYY-MM-DD, inclusive); optionally restores "DEPRECATE-" prefixed names set by SchedulesExpire.py |
 | `UserGroups.py` | mstrio-py + mstrio_core | Audit, export, and document user groups. Subcommands: `audit` (empty groups + directly-assigned privileges → separate files), `export` (all groups with members + privileges), `privileges` (direct privileges only, inherited excluded), `members` (direct members; `--resolve` for recursive effective-user expansion). All subcommands support `--format csv\|json`. |
+| `DatabaseInstances.py` | mstrio-py + mstrio_core | Export all database instance definitions → CSV: instance name/GUID, DBMS type (name + GUID), datasource connection (name, GUID, connection string / ODBC DSN), and default database login (name, GUID, username). Server-level; no project required. |
 
 ## Known Gaps / Improvement Areas
 
