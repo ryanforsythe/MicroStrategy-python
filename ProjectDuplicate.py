@@ -204,12 +204,40 @@ def _log_config_summary(cfg: dict, description: str, is_cross: bool) -> None:
         logger.info("  match_by_name:            {v}", v=cross.get("match_by_name", "none (GUID matching)"))
 
 
+def _log_failure_detail(project) -> None:
+    """Log all available detail from a failed duplication job object."""
+
+    def _get(attr: str, default: str = "(not available)") -> str:
+        val = getattr(project, attr, None)
+        return str(val) if val is not None else default
+
+    logger.error("─── Failure Detail ───")
+    logger.error("  message:          {v}", v=_get("message"))
+    logger.error("  progress:         {v}", v=_get("progress"))
+    logger.error("  job_instance_id:  {v}", v=_get("job_instance_id"))
+    logger.error("  source_project:   {v} ({id})",
+                 v=_get("source_project_name"), id=_get("source_project_id"))
+    logger.error("  target_project:   {v}", v=_get("target_project_name"))
+    logger.error("  source_env:       {v} ({id})",
+                 v=_get("source_env_name"), id=_get("source_env_id"))
+    logger.error("  target_env:       {v} ({id})",
+                 v=_get("target_env_name"), id=_get("target_env_id"))
+    logger.error("  created:          {v}", v=_get("created_timestamp"))
+    logger.error("  last_updated:     {v}", v=_get("last_updated_timestamp"))
+
+
 def _poll_project_ready(project: Project, interval: int, timeout: int) -> bool:
     """
     Poll until the duplicated project is loaded and ready.
 
-    Returns True if the project becomes ready within the timeout,
-    False otherwise.
+    Inspects the ProjectDuplicationStatus enum value by name so we don't
+    need to hard-code every possible status string.
+
+    Terminal states:
+      • Success  — name contains COMPLET, DONE, or SUCCESS
+      • Failure  — name contains FAILED, ERROR, or CANCEL
+
+    Returns True on success, False on failure or timeout.
     """
     start = time.time()
     elapsed = 0
@@ -218,16 +246,35 @@ def _poll_project_ready(project: Project, interval: int, timeout: int) -> bool:
         try:
             project.fetch()
             status = getattr(project, "status", None)
+
+            # Normalise to the enum member name (e.g. "EXPORT_FAILED") so the
+            # checks below work regardless of how __str__ is implemented.
+            status_name = (
+                status.name if hasattr(status, "name") else str(status)
+            ).upper()
+
+            progress = getattr(project, "progress", None)
+            progress_str = f"  progress: {progress}%" if progress is not None else ""
             logger.info(
-                "Project status: {status} (elapsed {sec:.0f}s)",
+                "Project status: {status}{progress} (elapsed {sec:.0f}s)",
                 status=status,
+                progress=progress_str,
                 sec=elapsed,
             )
-            # A successfully loaded project typically has status 0 or is
-            # simply accessible.  If fetch() succeeds without error the
-            # project exists on the server.
-            if status is not None and status == 0:
+
+            # ── Terminal failure ───────────────────────────────────────────
+            if any(f in status_name for f in ("FAILED", "ERROR", "CANCEL")):
+                logger.error(
+                    "Duplication ended with a failure status: {status}",
+                    status=status,
+                )
+                _log_failure_detail(project)
+                return False
+
+            # ── Terminal success ───────────────────────────────────────────
+            if any(s in status_name for s in ("COMPLET", "DONE", "SUCCESS")):
                 return True
+
         except Exception as exc:
             logger.debug(
                 "Waiting for project (elapsed {sec:.0f}s): {exc}",
