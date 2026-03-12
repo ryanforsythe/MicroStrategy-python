@@ -3,6 +3,8 @@
 # Used by ProjectDuplicate.py to clone a MicroStrategy project within the same
 # environment or across environments (dev / qa / prod).
 #
+# Uses the REST API: POST/PUT /api/projectDuplications
+#
 # Credentials are read from environment variables via mstrio_core — see .env.
 # This file controls *what* to duplicate and *how*.
 
@@ -23,29 +25,53 @@ project_name: "My Project"
 # target_project_name: "My Project - Prod Copy"
 
 # ── Duplication Parameters ────────────────────────────────────────────────────
-# Maps to mstrio.server.project.DuplicationConfig.
+# Maps to REST API: settings.export + settings.import
 # import_description is auto-populated from the source project's description.
 
 duplication:
+  # settings.export.projectObjectsPreference
   schema_objects_only: false            # false = all objects
   skip_empty_profile_folders: true
-  skip_all_profile_folders: false
+
+  # settings.export.subscriptionPreferences
   include_user_subscriptions: true      # include user delivery subscriptions
   include_contact_subscriptions: true   # include contact delivery subscriptions
-  include_contacts_and_contact_groups: true
+
+  # settings.import
   import_default_locale: 0              # 0 = default locale
-  # import_locales: null                # null = all languages
+  # import_locales: null                # null = all languages; or list: [1033, 2052]
 
 # ── Cross-Environment Parameters ─────────────────────────────────────────────
-# Maps to mstrio.server.project.CrossDuplicationConfig (extends duplication).
+# Maps to REST API: settings.export.configurationObjects +
+#                   settings.import.configurationObjects
 # Ignored when source_env == target_env (same-environment duplication).
 
 cross_duplication:
+  # settings.export.configurationObjects
   include_all_user_groups: true         # all user groups
+
+  # settings.import.configurationObjects
   match_users_by_login: false           # false = use same GUID, not login merge
-  # match_by_name: null                 # null = match objects by GUID
-  # admin_objects: null
-  # admin_objects_rules: null
+
+  # Optional: admin object type/rule pairs for export
+  # admin_objects_rules:
+  #   - type: 34
+  #     rule: 2
+  #   - type: 5
+  #     rule: 1
+
+  # Optional: specific admin object GUIDs to include in export
+  # admin_objects:
+  #   - "95A868464F2F105205B2848BBCB81C50"
+
+  # Optional: import conflict resolution rules
+  # conflict_rules:
+  #   - type: 44
+  #     rule: 2
+  #   - type: 34
+  #     rule: 6
+  #   - type: 5
+  #     rule: 1
 
 # ── Polling ───────────────────────────────────────────────────────────────────
 # Duplication is asynchronous.  The script polls for completion.
