@@ -184,10 +184,13 @@ def _build_request_body(
         },
     }
 
-    # Optional: import locales (omit to use all languages)
+    # Import locales — REST API requires a non-empty list.
+    # null / omitted in YAML → [0] (default locale = all languages).
     locales = dup.get("import_locales")
     if locales is not None:
         body["settings"]["import"]["locales"] = locales
+    else:
+        body["settings"]["import"]["locales"] = [0]
 
     # Cross-environment specific: export configurationObjects
     if is_cross:

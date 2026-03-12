@@ -39,7 +39,7 @@ duplication:
 
   # settings.import
   import_default_locale: 0              # 0 = default locale
-  # import_locales: null                # null = all languages; or list: [1033, 2052]
+  # import_locales: null                # null = all languages (sends [0]); or list: [1033, 2052]
 
 # ── Cross-Environment Parameters ─────────────────────────────────────────────
 # Maps to REST API: settings.export.configurationObjects +
