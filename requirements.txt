@@ -16,8 +16,9 @@ jmespath
 # Logging
 loguru
 
-# Environment variable / .env file support
-python-dotenv
+# Configuration
+python-dotenv  # .env file support
+pyyaml         # YAML config file support (ProjectDuplicate.py)
 
 # OS keyring integration (optional — for password-free .env files)
 # Enables storing credentials in Windows Credential Manager / macOS Keychain / SecretService.

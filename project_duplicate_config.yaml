@@ -1,0 +1,55 @@
+# ── Project Duplication Configuration ─────────────────────────────────────────
+#
+# Used by ProjectDuplicate.py to clone a MicroStrategy project within the same
+# environment or across environments (dev / qa / prod).
+#
+# Credentials are read from environment variables via mstrio_core — see .env.
+# This file controls *what* to duplicate and *how*.
+
+# ── Environments ──────────────────────────────────────────────────────────────
+# Valid values: dev, qa, prod
+# Set target_env equal to source_env for same-environment duplication.
+
+source_env: dev
+target_env: prod
+
+# ── Project ───────────────────────────────────────────────────────────────────
+# Identify the source project by name or GUID (use exactly one).
+
+project_name: "My Project"
+# project_id: "ABCDEF1234567890ABCDEF1234567890"
+
+# Name for the duplicated project.  Optional — defaults to the source name.
+# target_project_name: "My Project - Prod Copy"
+
+# ── Duplication Parameters ────────────────────────────────────────────────────
+# Maps to mstrio.server.project.DuplicationConfig.
+# import_description is auto-populated from the source project's description.
+
+duplication:
+  schema_objects_only: false            # false = all objects
+  skip_empty_profile_folders: true
+  skip_all_profile_folders: false
+  include_user_subscriptions: true      # include user delivery subscriptions
+  include_contact_subscriptions: true   # include contact delivery subscriptions
+  include_contacts_and_contact_groups: true
+  import_default_locale: 0              # 0 = default locale
+  # import_locales: null                # null = all languages
+
+# ── Cross-Environment Parameters ─────────────────────────────────────────────
+# Maps to mstrio.server.project.CrossDuplicationConfig (extends duplication).
+# Ignored when source_env == target_env (same-environment duplication).
+
+cross_duplication:
+  include_all_user_groups: true         # all user groups
+  match_users_by_login: false           # false = use same GUID, not login merge
+  # match_by_name: null                 # null = match objects by GUID
+  # admin_objects: null
+  # admin_objects_rules: null
+
+# ── Polling ───────────────────────────────────────────────────────────────────
+# Duplication is asynchronous.  The script polls for completion.
+
+polling:
+  interval_seconds: 15                  # seconds between status checks
+  timeout_seconds: 3600                 # maximum wait time (1 hour)
