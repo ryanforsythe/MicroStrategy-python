@@ -255,6 +255,11 @@ def _format_categories(cats) -> str:
     return str(cats)
 
 
+def _dicts_to_rows(dicts: list[dict], columns: list[str]) -> list[list]:
+    """Convert a list of dicts to a list of lists ordered by *columns*."""
+    return [[d.get(c, "") for c in columns] for d in dicts]
+
+
 def _merge_privilege_lists(*priv_lists: list[dict]) -> list[dict]:
     """
     Merge multiple privilege lists into a deduplicated superset, keyed by ID.
@@ -331,7 +336,11 @@ def export_role(
 
         if fmt == "csv":
             path = out / f"security_role_{safe_name}_{env}_{suffix}.csv"
-            write_csv(rows, columns=_EXPORT_CSV_COLS, path=path)
+            write_csv(
+                _dicts_to_rows(rows, _EXPORT_CSV_COLS),
+                columns=_EXPORT_CSV_COLS,
+                path=path,
+            )
         elif fmt == "json":
             path = out / f"security_role_{safe_name}_{env}_{suffix}.json"
             path.write_text(_json.dumps(rows, indent=2, default=str), encoding="utf-8")
@@ -470,7 +479,11 @@ def compare_roles(
 
     if fmt == "csv":
         path = out / f"security_role_compare_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}_{suffix}.csv"
-        write_csv(rows, columns=_COMPARE_CSV_COLS, path=path)
+        write_csv(
+            _dicts_to_rows(rows, _COMPARE_CSV_COLS),
+            columns=_COMPARE_CSV_COLS,
+            path=path,
+        )
     elif fmt == "json":
         path = out / f"security_role_compare_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}_{suffix}.json"
         path.write_text(_json.dumps(rows, indent=2, default=str), encoding="utf-8")
