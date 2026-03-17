@@ -519,18 +519,19 @@ def _compare_filter_maps(
 # ── Operations: Compare ──────────────────────────────────────────────────────
 
 
-def compare_roles(
+def _diff_roles(
     src_env: str,
     src_project: str,
     tgt_env: str,
     tgt_project: str,
-    fmt: str = "csv",
-    output_dir: Path | None = None,
-) -> None:
-    """Compare security role assignments between two projects."""
+) -> list[dict]:
+    """
+    Connect, build role maps, and return diff rows for one project pair.
+
+    Returns an empty list when assignments are identical.
+    """
     same_env = src_env == tgt_env
 
-    # ── Source ─────────────────────────────────────────────────────────────
     src_config = _make_config(src_env)
     src_conn = get_mstrio_connection(config=src_config)
     try:
@@ -553,7 +554,6 @@ def compare_roles(
     finally:
         src_conn.close()
 
-    # ── Target (cross-environment) ────────────────────────────────────────
     if not same_env:
         tgt_config = _make_config(tgt_env)
         tgt_conn = get_mstrio_connection(config=tgt_config)
@@ -568,7 +568,6 @@ def compare_roles(
         finally:
             tgt_conn.close()
 
-    # ── Compare & write ───────────────────────────────────────────────────
     rows = _compare_role_maps(
         src_map, tgt_map,
         src_project_name, src_env,
@@ -584,52 +583,34 @@ def compare_roles(
             tgt=tgt_project_name,
             tgt_env=tgt_env,
         )
-        return
-
-    n_src = sum(1 for r in rows if r["status"] == "source_only")
-    n_tgt = sum(1 for r in rows if r["status"] == "target_only")
-    n_diff = sum(1 for r in rows if r["status"] == "role_differs")
-    logger.info(
-        "{total} difference(s): {src_only} source-only, {tgt_only} target-only, "
-        "{role_diff} role-differs",
-        total=len(rows),
-        src_only=n_src,
-        tgt_only=n_tgt,
-        role_diff=n_diff,
-    )
-
-    out = _out_dir(src_config, output_dir)
-    src_safe = src_project_name.replace(" ", "_")
-    tgt_safe = tgt_project_name.replace(" ", "_")
-
-    if fmt == "csv":
-        path = out / f"project_roles_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}.csv"
-        write_csv(
-            _dicts_to_rows(rows, _ROLES_CSV_COLS),
-            columns=_ROLES_CSV_COLS,
-            path=path,
-        )
-    elif fmt == "json":
-        path = out / f"project_roles_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}.json"
-        path.write_text(_json.dumps(rows, indent=2, default=str), encoding="utf-8")
     else:
-        raise ValueError(f"Unsupported format {fmt!r}. Use 'csv' or 'json'.")
+        n_src = sum(1 for r in rows if r["status"] == "source_only")
+        n_tgt = sum(1 for r in rows if r["status"] == "target_only")
+        n_diff = sum(1 for r in rows if r["status"] == "role_differs")
+        logger.info(
+            "{total} difference(s): {src_only} source-only, {tgt_only} target-only, "
+            "{role_diff} role-differs",
+            total=len(rows),
+            src_only=n_src,
+            tgt_only=n_tgt,
+            role_diff=n_diff,
+        )
+    return rows
 
-    logger.success("Diff ({n} rows) written → {path}", n=len(rows), path=path)
 
-
-def compare_filters(
+def _diff_filters(
     src_env: str,
     src_project: str,
     tgt_env: str,
     tgt_project: str,
-    fmt: str = "csv",
-    output_dir: Path | None = None,
-) -> None:
-    """Compare security filter assignments between two projects."""
+) -> list[dict]:
+    """
+    Connect, build filter maps, and return diff rows for one project pair.
+
+    Returns an empty list when assignments are identical.
+    """
     same_env = src_env == tgt_env
 
-    # ── Source ─────────────────────────────────────────────────────────────
     src_config = _make_config(src_env)
     src_conn = get_mstrio_connection(config=src_config)
     try:
@@ -652,7 +633,6 @@ def compare_filters(
     finally:
         src_conn.close()
 
-    # ── Target (cross-environment) ────────────────────────────────────────
     if not same_env:
         tgt_config = _make_config(tgt_env)
         tgt_conn = get_mstrio_connection(config=tgt_config)
@@ -667,7 +647,6 @@ def compare_filters(
         finally:
             tgt_conn.close()
 
-    # ── Compare & write ───────────────────────────────────────────────────
     rows = _compare_filter_maps(
         src_map, tgt_map,
         src_project_name, src_env,
@@ -683,35 +662,75 @@ def compare_filters(
             tgt=tgt_project_name,
             tgt_env=tgt_env,
         )
-        return
-
-    n_src = sum(1 for r in rows if r["status"] == "source_only")
-    n_tgt = sum(1 for r in rows if r["status"] == "target_only")
-    logger.info(
-        "{total} difference(s): {src_only} source-only, {tgt_only} target-only",
-        total=len(rows),
-        src_only=n_src,
-        tgt_only=n_tgt,
-    )
-
-    out = _out_dir(src_config, output_dir)
-    src_safe = src_project_name.replace(" ", "_")
-    tgt_safe = tgt_project_name.replace(" ", "_")
-
-    if fmt == "csv":
-        path = out / f"project_filters_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}.csv"
-        write_csv(
-            _dicts_to_rows(rows, _FILTERS_CSV_COLS),
-            columns=_FILTERS_CSV_COLS,
-            path=path,
+    else:
+        n_src = sum(1 for r in rows if r["status"] == "source_only")
+        n_tgt = sum(1 for r in rows if r["status"] == "target_only")
+        logger.info(
+            "{total} difference(s): {src_only} source-only, {tgt_only} target-only",
+            total=len(rows),
+            src_only=n_src,
+            tgt_only=n_tgt,
         )
+    return rows
+
+
+def _write_output(
+    rows: list[dict],
+    columns: list[str],
+    fmt: str,
+    path_stem: str,
+    out_dir: Path,
+) -> None:
+    """Write diff rows to CSV or JSON."""
+    if fmt == "csv":
+        path = out_dir / f"{path_stem}.csv"
+        write_csv(_dicts_to_rows(rows, columns), columns=columns, path=path)
     elif fmt == "json":
-        path = out / f"project_filters_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}.json"
+        path = out_dir / f"{path_stem}.json"
         path.write_text(_json.dumps(rows, indent=2, default=str), encoding="utf-8")
     else:
         raise ValueError(f"Unsupported format {fmt!r}. Use 'csv' or 'json'.")
-
     logger.success("Diff ({n} rows) written → {path}", n=len(rows), path=path)
+
+
+def compare_roles(
+    src_env: str,
+    src_project: str,
+    tgt_env: str,
+    tgt_project: str,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """Compare security role assignments between two projects."""
+    rows = _diff_roles(src_env, src_project, tgt_env, tgt_project)
+    if not rows:
+        return
+
+    out = _out_dir(_make_config(src_env), output_dir)
+    src_safe = src_project.replace(" ", "_")
+    tgt_safe = tgt_project.replace(" ", "_")
+    stem = f"project_roles_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}"
+    _write_output(rows, _ROLES_CSV_COLS, fmt, stem, out)
+
+
+def compare_filters(
+    src_env: str,
+    src_project: str,
+    tgt_env: str,
+    tgt_project: str,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """Compare security filter assignments between two projects."""
+    rows = _diff_filters(src_env, src_project, tgt_env, tgt_project)
+    if not rows:
+        return
+
+    out = _out_dir(_make_config(src_env), output_dir)
+    src_safe = src_project.replace(" ", "_")
+    tgt_safe = tgt_project.replace(" ", "_")
+    stem = f"project_filters_diff_{src_safe}_{src_env}_vs_{tgt_safe}_{tgt_env}"
+    _write_output(rows, _FILTERS_CSV_COLS, fmt, stem, out)
 
 
 # ── Operations: Batch ────────────────────────────────────────────────────────
@@ -727,12 +746,14 @@ def batch_compare_roles(
     """
     Compare security role assignments for every project listed in a file.
 
-    Each project name is used as both the source and target project name
-    (compared across the two environments, or between the same project name
-    on the same environment if src_env == tgt_env).
+    All results are collected into a single output file.
+    Each project name is used as both source and target project name
+    (compared across the two environments).
     """
     projects = _read_projects_file(projects_file)
     total = len(projects)
+    all_rows: list[dict] = []
+
     for i, proj_name in enumerate(projects, 1):
         logger.info(
             "── [{i}/{total}] Roles: {proj!r}  ({src} → {tgt}) ──",
@@ -743,21 +764,28 @@ def batch_compare_roles(
             tgt=tgt_env,
         )
         try:
-            compare_roles(
-                src_env=src_env,
-                src_project=proj_name,
-                tgt_env=tgt_env,
-                tgt_project=proj_name,
-                fmt=fmt,
-                output_dir=output_dir,
-            )
+            rows = _diff_roles(src_env, proj_name, tgt_env, proj_name)
+            all_rows.extend(rows)
         except Exception as exc:
             logger.error(
                 "Failed for project {proj!r}: {exc}",
                 proj=proj_name,
                 exc=exc,
             )
-    logger.info("Batch complete: {n} project(s) processed", n=total)
+
+    logger.info(
+        "Batch complete: {n} project(s) processed, {rows} total difference(s)",
+        n=total,
+        rows=len(all_rows),
+    )
+
+    if not all_rows:
+        logger.info("No differences found across any project.")
+        return
+
+    out = _out_dir(_make_config(src_env), output_dir)
+    stem = f"project_roles_diff_{src_env}_vs_{tgt_env}_batch"
+    _write_output(all_rows, _ROLES_CSV_COLS, fmt, stem, out)
 
 
 def batch_compare_filters(
@@ -769,9 +797,13 @@ def batch_compare_filters(
 ) -> None:
     """
     Compare security filter assignments for every project listed in a file.
+
+    All results are collected into a single output file.
     """
     projects = _read_projects_file(projects_file)
     total = len(projects)
+    all_rows: list[dict] = []
+
     for i, proj_name in enumerate(projects, 1):
         logger.info(
             "── [{i}/{total}] Filters: {proj!r}  ({src} → {tgt}) ──",
@@ -782,21 +814,28 @@ def batch_compare_filters(
             tgt=tgt_env,
         )
         try:
-            compare_filters(
-                src_env=src_env,
-                src_project=proj_name,
-                tgt_env=tgt_env,
-                tgt_project=proj_name,
-                fmt=fmt,
-                output_dir=output_dir,
-            )
+            rows = _diff_filters(src_env, proj_name, tgt_env, proj_name)
+            all_rows.extend(rows)
         except Exception as exc:
             logger.error(
                 "Failed for project {proj!r}: {exc}",
                 proj=proj_name,
                 exc=exc,
             )
-    logger.info("Batch complete: {n} project(s) processed", n=total)
+
+    logger.info(
+        "Batch complete: {n} project(s) processed, {rows} total difference(s)",
+        n=total,
+        rows=len(all_rows),
+    )
+
+    if not all_rows:
+        logger.info("No differences found across any project.")
+        return
+
+    out = _out_dir(_make_config(src_env), output_dir)
+    stem = f"project_filters_diff_{src_env}_vs_{tgt_env}_batch"
+    _write_output(all_rows, _FILTERS_CSV_COLS, fmt, stem, out)
 
 
 # ── Operations: Apply ────────────────────────────────────────────────────────
