@@ -3,9 +3,13 @@ SecurityRoles.py — Export and compare MicroStrategy security role privileges.
 
 Subcommands
 ───────────
-  export   — Show privileges for a security role.  By default lists only
-             enabled privileges; pass --all to list every privilege with an
-             enabled/disabled indicator.
+  list-all — Export privileges for every security role on an environment.
+             By default includes only enabled privileges; pass --all to list
+             every privilege for each role with an enabled/disabled indicator.
+
+  export   — Show privileges for a single named security role.  By default
+             lists only enabled privileges; pass --all to list every privilege
+             with an enabled/disabled indicator.
 
   compare  — Compare privileges between two security roles (same or different
              environments).  By default shows only differences; pass --all to
@@ -13,6 +17,9 @@ Subcommands
 
 Usage
 ─────
+  python SecurityRoles.py list-all <env>
+                                   [--all] [--format csv|json] [--output-dir PATH]
+
   python SecurityRoles.py export  <env> <role>
                                   [--all] [--format csv|json] [--output-dir PATH]
 
@@ -21,6 +28,12 @@ Usage
 
 Examples
 ────────
+  # List enabled privileges for all roles on dev
+  python SecurityRoles.py list-all dev
+
+  # List ALL privileges (enabled + disabled) for all roles on qa
+  python SecurityRoles.py list-all qa --all
+
   # List enabled privileges for "Normal Users" on dev
   python SecurityRoles.py export dev "Normal Users"
 
@@ -34,7 +47,7 @@ Examples
   python SecurityRoles.py compare prod "Normal Users" prod "Power Users" --all
 
   # JSON output
-  python SecurityRoles.py export dev "Normal Users" --all --format json
+  python SecurityRoles.py list-all dev --all --format json
 """
 
 import argparse
@@ -279,6 +292,87 @@ def _merge_privilege_lists(*priv_lists: list[dict]) -> list[dict]:
 # ── Operations ────────────────────────────────────────────────────────────────
 
 
+def list_all_roles(
+    env: str,
+    show_all: bool = False,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """
+    Export privileges for every security role on an environment.
+
+    Each output row contains the role name/ID alongside the privilege details,
+    making it easy to compare roles in a pivot table or filter by role.
+
+    Args:
+        env:        Environment to connect to.
+        show_all:   True  → every privilege listed per role with enabled flag;
+                    False → only enabled privileges per role (default).
+        fmt:        Output format: "csv" or "json".
+        output_dir: Output directory (default: MstrConfig.output_dir).
+    """
+    config = _make_config(env)
+    conn = get_mstrio_connection(config=config)
+    try:
+        # ── Master privilege catalog ──────────────────────────────────────
+        all_privs = _get_all_privileges(conn)
+
+        # ── All security roles ────────────────────────────────────────────
+        roles = list_security_roles(conn)
+        logger.info("Found {n} security roles on {env}", n=len(roles), env=env)
+
+        # ── Build rows — one set per role ─────────────────────────────────
+        all_rows: list[dict] = []
+        for role in sorted(roles, key=lambda r: r.name.lower()):
+            enabled_ids = _get_role_privilege_ids(role)
+            rows = _build_export_rows(role, all_privs, enabled_ids, show_all)
+            all_rows.extend(rows)
+            logger.debug(
+                "Role {name!r}: {n}/{total} privileges enabled",
+                name=role.name,
+                n=len(enabled_ids),
+                total=len(all_privs),
+            )
+
+        if not all_rows:
+            logger.warning("No privileges to report for any role.")
+            return
+
+        logger.info(
+            "{rows} total rows across {r} roles",
+            rows=len(all_rows),
+            r=len(roles),
+        )
+
+        # ── Write output ──────────────────────────────────────────────────
+        suffix = "all" if show_all else "enabled"
+        out = _out_dir(config, output_dir)
+
+        if fmt == "csv":
+            path = out / f"security_roles_{env}_{suffix}.csv"
+            write_csv(
+                _dicts_to_rows(all_rows, _EXPORT_CSV_COLS),
+                columns=_EXPORT_CSV_COLS,
+                path=path,
+            )
+        elif fmt == "json":
+            path = out / f"security_roles_{env}_{suffix}.json"
+            path.write_text(
+                _json.dumps(all_rows, indent=2, default=str), encoding="utf-8"
+            )
+        else:
+            raise ValueError(f"Unsupported format {fmt!r}. Use 'csv' or 'json'.")
+
+        logger.success(
+            "Exported {n} rows for {r} role(s) → {path}",
+            n=len(all_rows),
+            r=len(roles),
+            path=path,
+        )
+    finally:
+        conn.close()
+
+
 def export_role(
     env: str,
     role_name: str,
@@ -506,6 +600,9 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
+            "  python SecurityRoles.py list-all dev\n"
+            "  python SecurityRoles.py list-all qa --all\n"
+            "  python SecurityRoles.py list-all dev --all --format json\n"
             '  python SecurityRoles.py export dev "Normal Users"\n'
             '  python SecurityRoles.py export dev "Normal Users" --all\n'
             '  python SecurityRoles.py export dev "Normal Users" --all --format json\n'
@@ -515,6 +612,30 @@ if __name__ == "__main__":
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── list-all ──────────────────────────────────────────────────────────
+    la = sub.add_parser(
+        "list-all",
+        help="Export privileges for every security role on an environment.",
+    )
+    la.add_argument("env", choices=ENVS, help="Environment (dev, qa, prod).")
+    la.add_argument(
+        "--all",
+        dest="show_all",
+        action="store_true",
+        default=False,
+        help=(
+            "List every privilege per role with enabled/disabled status "
+            "(default: enabled privileges only)."
+        ),
+    )
+    la.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        help="Output format (default: csv).",
+    )
+    la.add_argument("--output-dir", type=Path, default=None, metavar="PATH")
 
     # ── export ────────────────────────────────────────────────────────────
     exp = sub.add_parser(
@@ -565,7 +686,14 @@ if __name__ == "__main__":
     # ── Dispatch ──────────────────────────────────────────────────────────
     args = parser.parse_args()
 
-    if args.command == "export":
+    if args.command == "list-all":
+        list_all_roles(
+            env=args.env,
+            show_all=args.show_all,
+            fmt=args.format,
+            output_dir=args.output_dir,
+        )
+    elif args.command == "export":
         export_role(
             env=args.env,
             role_name=args.role,
