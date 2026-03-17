@@ -1,41 +1,77 @@
 """
 ProjectSecurityCompare.py — Compare project-level security role assignments and
-security filter assignments between two MicroStrategy projects.
+security filter assignments between two MicroStrategy projects, then optionally
+apply changes to the target.
 
 Subcommands
 ───────────
-  roles    — Compare which users/groups are assigned to which security roles
-             in each project.  Shows members that are in one project but not
-             the other, or that have a different role assignment.
+  roles         — Compare which users/groups are assigned to which security
+                  roles in each project.  Shows members in one project but not
+                  the other, or with a different role assignment.  Outputs a CSV
+                  with a target_action column (Apply / Remove).
 
-  filters  — Compare which users/groups have which security filters applied
-             in each project.  Shows filter+member pairs present in one project
-             but not the other.
+  filters       — Compare which users/groups have which security filters in
+                  each project.  Outputs a CSV with a target_action column.
+
+  apply-roles   — Read a roles diff CSV (from the roles subcommand), then
+                  grant or revoke security role assignments on the target
+                  project according to the target_action column.
+
+  apply-filters — Read a filters diff CSV (from the filters subcommand), then
+                  apply or revoke security filter assignments on the target
+                  project according to the target_action column.
 
 Usage
 ─────
-  python ProjectSecurityCompare.py roles   <env> <project> <env2> <project2>
+  # Single project pair (different project names)
+  python ProjectSecurityCompare.py roles   <env> <env2> <project> [<project2>]
                                            [--format csv|json] [--output-dir PATH]
 
-  python ProjectSecurityCompare.py filters <env> <project> <env2> <project2>
+  python ProjectSecurityCompare.py filters <env> <env2> <project> [<project2>]
                                            [--format csv|json] [--output-dir PATH]
+
+  # Batch — iterate over a project list file (one project name per line)
+  python ProjectSecurityCompare.py roles   <env> <env2> --projects-file FILE
+                                           [--format csv|json] [--output-dir PATH]
+
+  python ProjectSecurityCompare.py filters <env> <env2> --projects-file FILE
+                                           [--format csv|json] [--output-dir PATH]
+
+  # Apply from diff CSV
+  python ProjectSecurityCompare.py apply-roles   <csv-file>  [--apply]
+  python ProjectSecurityCompare.py apply-filters <csv-file>  [--apply]
+
+  Note: when project2 is omitted the source project name is used for both.
 
 Examples
 ────────
-  # Compare security role assignments between two projects on QA
-  python ProjectSecurityCompare.py roles qa "Finance" qa "Finance UAT"
+  # 1. Compare roles — different project names on same environment
+  python ProjectSecurityCompare.py roles qa qa "Finance" "Finance UAT"
 
-  # Compare security role assignments across environments
-  python ProjectSecurityCompare.py roles dev "Analytics" prod "Analytics"
+  # 2. Compare roles — same project across environments (project2 omitted)
+  python ProjectSecurityCompare.py roles dev prod "Analytics"
 
-  # Compare security filter assignments between two projects on prod
-  python ProjectSecurityCompare.py filters prod "Finance" prod "Finance UAT"
+  # 3. Review CSV → apply
+  python ProjectSecurityCompare.py apply-roles c:/tmp/project_roles_diff_....csv
+  python ProjectSecurityCompare.py apply-roles c:/tmp/project_roles_diff_....csv --apply
 
-  # JSON output
-  python ProjectSecurityCompare.py roles dev "Project A" qa "Project A" --format json
+  # 4. Compare filters → review → apply
+  python ProjectSecurityCompare.py filters prod prod "Finance" "Finance UAT"
+  python ProjectSecurityCompare.py apply-filters c:/tmp/project_filters_diff_....csv --apply
+
+  # 5. Batch — compare roles for multiple projects between dev and prod
+  #    projects.txt contains one project name per line:
+  #      Finance
+  #      HR Analytics
+  #      Marketing
+  python ProjectSecurityCompare.py roles dev prod --projects-file projects.txt
+
+  # 6. Batch — compare filters for multiple projects on same environment
+  python ProjectSecurityCompare.py filters qa qa --projects-file projects.txt
 """
 
 import argparse
+import csv
 import json as _json
 from pathlib import Path
 
@@ -71,6 +107,7 @@ _ROLES_CSV_COLS = [
     "target_project",
     "target_env",
     "status",
+    "target_action",
 ]
 
 _FILTERS_CSV_COLS = [
@@ -84,7 +121,16 @@ _FILTERS_CSV_COLS = [
     "target_project",
     "target_env",
     "status",
+    "target_action",
 ]
+
+# Register the same CSV dialect used by mstrio_core.write_csv
+csv.register_dialect(
+    "mstr_csv_read",
+    delimiter=";",
+    quoting=csv.QUOTE_NONNUMERIC,
+    lineterminator="\n",
+)
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -134,6 +180,63 @@ def _resolve_project_name(conn, project_name: str) -> str:
         raise ValueError(
             f"Project {project_name!r} not found: {exc}"
         ) from exc
+
+
+def _read_projects_file(path: Path) -> list[str]:
+    """
+    Read a project list file — one project name per line.
+
+    Blank lines and lines starting with '#' are ignored.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Projects file not found: {p}")
+    names = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            names.append(stripped)
+    if not names:
+        raise ValueError(f"Projects file is empty: {p}")
+    logger.info("Loaded {n} project(s) from {path}", n=len(names), path=p)
+    return names
+
+
+def _target_action(status: str) -> str:
+    """
+    Default target_action based on diff status.
+
+    source_only  → Apply  (member should be granted the role/filter on target)
+    target_only  → Remove (member should be revoked from the role/filter on target)
+    role_differs → Apply  (member's role on target should match the source)
+    """
+    if status == "source_only":
+        return "Apply"
+    if status == "target_only":
+        return "Remove"
+    if status == "role_differs":
+        return "Apply"
+    return ""
+
+
+def _read_diff_csv(csv_path: Path) -> list[dict]:
+    """
+    Read a semicolon-delimited diff CSV back into a list of dicts.
+
+    Handles the mstr_csv dialect (semicolon delimiter, QUOTE_NONNUMERIC).
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+
+    rows: list[dict] = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f, dialect="mstr_csv_read")
+        for row in reader:
+            rows.append(dict(row))
+
+    logger.info("Read {n} rows from {path}", n=len(rows), path=path)
+    return rows
 
 
 # ── Security Role comparison ─────────────────────────────────────────────────
@@ -213,6 +316,7 @@ def _compare_role_maps(
         t = tgt_map.get(mid)
 
         if s and not t:
+            status = "source_only"
             rows.append(
                 {
                     "member_id": mid,
@@ -226,10 +330,12 @@ def _compare_role_maps(
                     "source_env": src_env,
                     "target_project": tgt_project,
                     "target_env": tgt_env,
-                    "status": "source_only",
+                    "status": status,
+                    "target_action": _target_action(status),
                 }
             )
         elif t and not s:
+            status = "target_only"
             rows.append(
                 {
                     "member_id": mid,
@@ -243,10 +349,12 @@ def _compare_role_maps(
                     "source_env": src_env,
                     "target_project": tgt_project,
                     "target_env": tgt_env,
-                    "status": "target_only",
+                    "status": status,
+                    "target_action": _target_action(status),
                 }
             )
         elif s["role_id"] != t["role_id"]:
+            status = "role_differs"
             rows.append(
                 {
                     "member_id": mid,
@@ -260,7 +368,8 @@ def _compare_role_maps(
                     "source_env": src_env,
                     "target_project": tgt_project,
                     "target_env": tgt_env,
-                    "status": "role_differs",
+                    "status": status,
+                    "target_action": _target_action(status),
                 }
             )
 
@@ -368,6 +477,7 @@ def _compare_filter_maps(
         t = tgt_map.get(key)
 
         if s and not t:
+            status = "source_only"
             rows.append(
                 {
                     "filter_name": fname,
@@ -379,10 +489,12 @@ def _compare_filter_maps(
                     "source_env": src_env,
                     "target_project": tgt_project,
                     "target_env": tgt_env,
-                    "status": "source_only",
+                    "status": status,
+                    "target_action": _target_action(status),
                 }
             )
         elif t and not s:
+            status = "target_only"
             rows.append(
                 {
                     "filter_name": fname,
@@ -394,7 +506,8 @@ def _compare_filter_maps(
                     "source_env": src_env,
                     "target_project": tgt_project,
                     "target_env": tgt_env,
-                    "status": "target_only",
+                    "status": status,
+                    "target_action": _target_action(status),
                 }
             )
         # If both exist with the same key, they match — no row needed
@@ -403,7 +516,7 @@ def _compare_filter_maps(
     return rows
 
 
-# ── Operations ────────────────────────────────────────────────────────────────
+# ── Operations: Compare ──────────────────────────────────────────────────────
 
 
 def compare_roles(
@@ -601,22 +714,437 @@ def compare_filters(
     logger.success("Diff ({n} rows) written → {path}", n=len(rows), path=path)
 
 
+# ── Operations: Batch ────────────────────────────────────────────────────────
+
+
+def batch_compare_roles(
+    src_env: str,
+    tgt_env: str,
+    projects_file: Path,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """
+    Compare security role assignments for every project listed in a file.
+
+    Each project name is used as both the source and target project name
+    (compared across the two environments, or between the same project name
+    on the same environment if src_env == tgt_env).
+    """
+    projects = _read_projects_file(projects_file)
+    total = len(projects)
+    for i, proj_name in enumerate(projects, 1):
+        logger.info(
+            "── [{i}/{total}] Roles: {proj!r}  ({src} → {tgt}) ──",
+            i=i,
+            total=total,
+            proj=proj_name,
+            src=src_env,
+            tgt=tgt_env,
+        )
+        try:
+            compare_roles(
+                src_env=src_env,
+                src_project=proj_name,
+                tgt_env=tgt_env,
+                tgt_project=proj_name,
+                fmt=fmt,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed for project {proj!r}: {exc}",
+                proj=proj_name,
+                exc=exc,
+            )
+    logger.info("Batch complete: {n} project(s) processed", n=total)
+
+
+def batch_compare_filters(
+    src_env: str,
+    tgt_env: str,
+    projects_file: Path,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """
+    Compare security filter assignments for every project listed in a file.
+    """
+    projects = _read_projects_file(projects_file)
+    total = len(projects)
+    for i, proj_name in enumerate(projects, 1):
+        logger.info(
+            "── [{i}/{total}] Filters: {proj!r}  ({src} → {tgt}) ──",
+            i=i,
+            total=total,
+            proj=proj_name,
+            src=src_env,
+            tgt=tgt_env,
+        )
+        try:
+            compare_filters(
+                src_env=src_env,
+                src_project=proj_name,
+                tgt_env=tgt_env,
+                tgt_project=proj_name,
+                fmt=fmt,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed for project {proj!r}: {exc}",
+                proj=proj_name,
+                exc=exc,
+            )
+    logger.info("Batch complete: {n} project(s) processed", n=total)
+
+
+# ── Operations: Apply ────────────────────────────────────────────────────────
+
+
+def apply_roles(csv_path: Path, dry_run: bool = True) -> None:
+    """
+    Read a roles diff CSV and grant/revoke security role assignments on the
+    target project.
+
+    The CSV must have been produced by the ``roles`` subcommand (or manually
+    edited to the same schema).  Only rows whose ``target_action`` column is
+    "Apply" or "Remove" are processed; blank/empty rows are skipped.
+
+    Apply logic:
+      Apply  + source_only  → grant source_role to member on target project
+      Apply  + role_differs → revoke target_role, then grant source_role
+      Remove + target_only  → revoke target_role from member on target project
+      Remove + role_differs → revoke target_role (do not grant source_role)
+    """
+    rows = _read_diff_csv(csv_path)
+    actionable = [
+        r for r in rows if r.get("target_action", "").strip() in ("Apply", "Remove")
+    ]
+
+    if not actionable:
+        logger.info("No actionable rows (target_action = Apply or Remove). Nothing to do.")
+        return
+
+    n_apply = sum(1 for r in actionable if r["target_action"].strip() == "Apply")
+    n_remove = sum(1 for r in actionable if r["target_action"].strip() == "Remove")
+    logger.info(
+        "{n} actionable row(s): {a} Apply, {r} Remove",
+        n=len(actionable),
+        a=n_apply,
+        r=n_remove,
+    )
+
+    if dry_run:
+        logger.info("DRY RUN — no changes will be made.  Pass --apply to execute.")
+        for r in actionable:
+            action = r["target_action"].strip()
+            status = r.get("status", "")
+            member = r.get("member_name", r.get("member_id", "?"))
+            if action == "Apply":
+                role = r.get("source_role_name", "?")
+                logger.info(
+                    "  Would GRANT role {role!r} to {member!r} on {proj!r} ({env})",
+                    role=role,
+                    member=member,
+                    proj=r.get("target_project", "?"),
+                    env=r.get("target_env", "?"),
+                )
+                if status == "role_differs":
+                    old_role = r.get("target_role_name", "?")
+                    logger.info(
+                        "    (first revoke current role {old!r})",
+                        old=old_role,
+                    )
+            elif action == "Remove":
+                role = r.get("target_role_name", "?")
+                logger.info(
+                    "  Would REVOKE role {role!r} from {member!r} on {proj!r} ({env})",
+                    role=role,
+                    member=member,
+                    proj=r.get("target_project", "?"),
+                    env=r.get("target_env", "?"),
+                )
+        return
+
+    # ── Group rows by target environment + project ────────────────────────
+    # All rows in a single CSV share the same target_env and target_project,
+    # but we group defensively in case a CSV is manually composed.
+    by_target: dict[tuple[str, str], list[dict]] = {}
+    for r in actionable:
+        key = (r["target_env"].strip(), r["target_project"].strip())
+        by_target.setdefault(key, []).append(r)
+
+    for (tgt_env, tgt_project), target_rows in by_target.items():
+        config = _make_config(tgt_env)
+        conn = get_mstrio_connection(config=config)
+        try:
+            _resolve_project_name(conn, tgt_project)
+
+            # Cache role lookups
+            role_cache: dict[str, SecurityRole] = {}
+
+            for r in target_rows:
+                action = r["target_action"].strip()
+                status = r.get("status", "")
+                member_id = r["member_id"].strip()
+                member_name = r.get("member_name", member_id)
+                member_type = r.get("member_type", "User").strip()
+
+                # Resolve member
+                if member_type == "UserGroup":
+                    member = UserGroup(conn, id=member_id)
+                else:
+                    member = User(conn, id=member_id)
+
+                if action == "Apply":
+                    # Role to grant is the source role
+                    role_name = r.get("source_role_name", "").strip()
+                    role_id = r.get("source_role_id", "").strip()
+
+                    # Revoke existing role first if role_differs
+                    if status == "role_differs":
+                        old_role_id = r.get("target_role_id", "").strip()
+                        if old_role_id:
+                            old_role = _get_or_cache_role(
+                                conn, role_cache, old_role_id,
+                                r.get("target_role_name", ""),
+                            )
+                            try:
+                                old_role.revoke_from(
+                                    [member], project=Project(conn, name=tgt_project)
+                                )
+                                logger.info(
+                                    "Revoked role {role!r} from {member!r}",
+                                    role=old_role.name,
+                                    member=member_name,
+                                )
+                            except Exception as exc:
+                                logger.error(
+                                    "Failed to revoke role {role!r} from {member!r}: {exc}",
+                                    role=old_role.name,
+                                    member=member_name,
+                                    exc=exc,
+                                )
+                                continue
+
+                    # Grant the source role
+                    if role_id:
+                        role = _get_or_cache_role(conn, role_cache, role_id, role_name)
+                        try:
+                            role.grant_to(
+                                [member], project=Project(conn, name=tgt_project)
+                            )
+                            logger.success(
+                                "Granted role {role!r} to {member!r} on {proj!r}",
+                                role=role.name,
+                                member=member_name,
+                                proj=tgt_project,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to grant role {role!r} to {member!r}: {exc}",
+                                role=role.name,
+                                member=member_name,
+                                exc=exc,
+                            )
+
+                elif action == "Remove":
+                    # Revoke the target role
+                    role_name = r.get("target_role_name", "").strip()
+                    role_id = r.get("target_role_id", "").strip()
+                    if role_id:
+                        role = _get_or_cache_role(conn, role_cache, role_id, role_name)
+                        try:
+                            role.revoke_from(
+                                [member], project=Project(conn, name=tgt_project)
+                            )
+                            logger.success(
+                                "Revoked role {role!r} from {member!r} on {proj!r}",
+                                role=role.name,
+                                member=member_name,
+                                proj=tgt_project,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "Failed to revoke role {role!r} from {member!r}: {exc}",
+                                role=role.name,
+                                member=member_name,
+                                exc=exc,
+                            )
+        finally:
+            conn.close()
+
+
+def apply_filters(csv_path: Path, dry_run: bool = True) -> None:
+    """
+    Read a filters diff CSV and apply/revoke security filter assignments on
+    the target project.
+
+    Apply logic:
+      Apply  + source_only → apply the security filter to the member on target
+      Remove + target_only → revoke the security filter from the member on target
+    """
+    rows = _read_diff_csv(csv_path)
+    actionable = [
+        r for r in rows if r.get("target_action", "").strip() in ("Apply", "Remove")
+    ]
+
+    if not actionable:
+        logger.info("No actionable rows (target_action = Apply or Remove). Nothing to do.")
+        return
+
+    n_apply = sum(1 for r in actionable if r["target_action"].strip() == "Apply")
+    n_remove = sum(1 for r in actionable if r["target_action"].strip() == "Remove")
+    logger.info(
+        "{n} actionable row(s): {a} Apply, {r} Remove",
+        n=len(actionable),
+        a=n_apply,
+        r=n_remove,
+    )
+
+    if dry_run:
+        logger.info("DRY RUN — no changes will be made.  Pass --apply to execute.")
+        for r in actionable:
+            action = r["target_action"].strip()
+            member = r.get("member_name", r.get("member_id", "?"))
+            fname = r.get("filter_name", "?")
+            if action == "Apply":
+                logger.info(
+                    "  Would APPLY filter {filter!r} to {member!r} on {proj!r} ({env})",
+                    filter=fname,
+                    member=member,
+                    proj=r.get("target_project", "?"),
+                    env=r.get("target_env", "?"),
+                )
+            elif action == "Remove":
+                logger.info(
+                    "  Would REVOKE filter {filter!r} from {member!r} on {proj!r} ({env})",
+                    filter=fname,
+                    member=member,
+                    proj=r.get("target_project", "?"),
+                    env=r.get("target_env", "?"),
+                )
+        return
+
+    # ── Group by target environment + project ─────────────────────────────
+    by_target: dict[tuple[str, str], list[dict]] = {}
+    for r in actionable:
+        key = (r["target_env"].strip(), r["target_project"].strip())
+        by_target.setdefault(key, []).append(r)
+
+    for (tgt_env, tgt_project), target_rows in by_target.items():
+        config = _make_config(tgt_env)
+        conn = get_mstrio_connection(config=config)
+        try:
+            _resolve_project_name(conn, tgt_project)
+
+            # Cache filter lookups
+            filter_cache: dict[str, SecurityFilter] = {}
+
+            for r in target_rows:
+                action = r["target_action"].strip()
+                member_id = r["member_id"].strip()
+                member_name = r.get("member_name", member_id)
+                member_type = r.get("member_type", "User").strip()
+                filter_id = r.get("filter_id", "").strip()
+                filter_name = r.get("filter_name", "?")
+
+                if not filter_id:
+                    logger.warning(
+                        "Skipping row — no filter_id for filter {f!r}",
+                        f=filter_name,
+                    )
+                    continue
+
+                # Resolve member
+                if member_type == "UserGroup":
+                    member = UserGroup(conn, id=member_id)
+                else:
+                    member = User(conn, id=member_id)
+
+                # Resolve filter
+                sf = _get_or_cache_filter(conn, filter_cache, filter_id, filter_name)
+
+                if action == "Apply":
+                    try:
+                        sf.apply([member])
+                        logger.success(
+                            "Applied filter {filter!r} to {member!r} on {proj!r}",
+                            filter=sf.name,
+                            member=member_name,
+                            proj=tgt_project,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to apply filter {filter!r} to {member!r}: {exc}",
+                            filter=sf.name,
+                            member=member_name,
+                            exc=exc,
+                        )
+
+                elif action == "Remove":
+                    try:
+                        sf.revoke([member])
+                        logger.success(
+                            "Revoked filter {filter!r} from {member!r} on {proj!r}",
+                            filter=sf.name,
+                            member=member_name,
+                            proj=tgt_project,
+                        )
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to revoke filter {filter!r} from {member!r}: {exc}",
+                            filter=sf.name,
+                            member=member_name,
+                            exc=exc,
+                        )
+        finally:
+            conn.close()
+
+
+# ── Cache helpers ─────────────────────────────────────────────────────────────
+
+
+def _get_or_cache_role(
+    conn, cache: dict[str, SecurityRole], role_id: str, role_name: str
+) -> SecurityRole:
+    """Retrieve a SecurityRole from cache or fetch it by ID."""
+    if role_id not in cache:
+        cache[role_id] = SecurityRole(conn, id=role_id)
+        logger.debug("Cached role: {name} ({id})", name=role_name, id=role_id)
+    return cache[role_id]
+
+
+def _get_or_cache_filter(
+    conn, cache: dict[str, SecurityFilter], filter_id: str, filter_name: str
+) -> SecurityFilter:
+    """Retrieve a SecurityFilter from cache or fetch it by ID."""
+    if filter_id not in cache:
+        cache[filter_id] = SecurityFilter(conn, id=filter_id)
+        logger.debug("Cached filter: {name} ({id})", name=filter_name, id=filter_id)
+    return cache[filter_id]
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Compare project-level security role assignments and "
-            "security filter assignments between two MicroStrategy projects."
+            "Compare project-level security between two MicroStrategy projects, "
+            "then optionally apply changes to the target."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            '  python ProjectSecurityCompare.py roles   qa "Finance" qa "Finance UAT"\n'
-            '  python ProjectSecurityCompare.py roles   dev "Analytics" prod "Analytics"\n'
-            '  python ProjectSecurityCompare.py filters prod "Finance" prod "Finance UAT"\n'
-            '  python ProjectSecurityCompare.py filters dev "Project A" qa "Project A" --format json\n'
+            '  python ProjectSecurityCompare.py roles   qa qa "Finance" "Finance UAT"\n'
+            '  python ProjectSecurityCompare.py roles   dev prod "Analytics"\n'
+            '  python ProjectSecurityCompare.py roles   dev prod --projects-file projects.txt\n'
+            '  python ProjectSecurityCompare.py filters prod prod "Finance" "Finance UAT"\n'
+            '  python ProjectSecurityCompare.py apply-roles   c:/tmp/project_roles_diff.csv\n'
+            '  python ProjectSecurityCompare.py apply-roles   c:/tmp/project_roles_diff.csv --apply\n'
+            '  python ProjectSecurityCompare.py apply-filters c:/tmp/project_filters_diff.csv --apply\n'
         ),
     )
 
@@ -626,11 +1154,27 @@ if __name__ == "__main__":
     r_parser = sub.add_parser(
         "roles",
         help="Compare security role assignments between two projects.",
+        description=(
+            "Compare security role assignments.  Provide two project names\n"
+            "for a single comparison, or use --projects-file to iterate over\n"
+            "a list (same project name compared on both environments)."
+        ),
     )
     r_parser.add_argument("env", choices=ENVS, help="Source environment.")
-    r_parser.add_argument("project", help="Source project name.")
     r_parser.add_argument("env2", choices=ENVS, help="Target environment.")
-    r_parser.add_argument("project2", help="Target project name.")
+    r_parser.add_argument(
+        "project", nargs="?", default=None,
+        help="Source project name (required unless --projects-file).",
+    )
+    r_parser.add_argument(
+        "project2", nargs="?", default=None,
+        help="Target project name (defaults to source project name if omitted).",
+    )
+    r_parser.add_argument(
+        "--projects-file", type=Path, default=None, metavar="FILE",
+        help="Text file with project names (one per line). "
+             "Each project is compared across the two environments.",
+    )
     r_parser.add_argument(
         "--format", choices=["csv", "json"], default="csv",
         help="Output format (default: csv).",
@@ -641,35 +1185,123 @@ if __name__ == "__main__":
     f_parser = sub.add_parser(
         "filters",
         help="Compare security filter assignments between two projects.",
+        description=(
+            "Compare security filter assignments.  Provide two project names\n"
+            "for a single comparison, or use --projects-file to iterate over\n"
+            "a list (same project name compared on both environments)."
+        ),
     )
     f_parser.add_argument("env", choices=ENVS, help="Source environment.")
-    f_parser.add_argument("project", help="Source project name.")
     f_parser.add_argument("env2", choices=ENVS, help="Target environment.")
-    f_parser.add_argument("project2", help="Target project name.")
+    f_parser.add_argument(
+        "project", nargs="?", default=None,
+        help="Source project name (required unless --projects-file).",
+    )
+    f_parser.add_argument(
+        "project2", nargs="?", default=None,
+        help="Target project name (defaults to source project name if omitted).",
+    )
+    f_parser.add_argument(
+        "--projects-file", type=Path, default=None, metavar="FILE",
+        help="Text file with project names (one per line). "
+             "Each project is compared across the two environments.",
+    )
     f_parser.add_argument(
         "--format", choices=["csv", "json"], default="csv",
         help="Output format (default: csv).",
     )
     f_parser.add_argument("--output-dir", type=Path, default=None, metavar="PATH")
 
+    # ── apply-roles ───────────────────────────────────────────────────────
+    ar_parser = sub.add_parser(
+        "apply-roles",
+        help="Apply role changes from a diff CSV to the target project.",
+    )
+    ar_parser.add_argument(
+        "csv_file", type=Path,
+        help="Path to the roles diff CSV (from the roles subcommand).",
+    )
+    ar_parser.add_argument(
+        "--apply",
+        dest="dry_run",
+        action="store_false",
+        default=True,
+        help="Execute changes (default: dry run).",
+    )
+
+    # ── apply-filters ─────────────────────────────────────────────────────
+    af_parser = sub.add_parser(
+        "apply-filters",
+        help="Apply filter changes from a diff CSV to the target project.",
+    )
+    af_parser.add_argument(
+        "csv_file", type=Path,
+        help="Path to the filters diff CSV (from the filters subcommand).",
+    )
+    af_parser.add_argument(
+        "--apply",
+        dest="dry_run",
+        action="store_false",
+        default=True,
+        help="Execute changes (default: dry run).",
+    )
+
     # ── Dispatch ──────────────────────────────────────────────────────────
     args = parser.parse_args()
 
     if args.command == "roles":
-        compare_roles(
-            src_env=args.env,
-            src_project=args.project,
-            tgt_env=args.env2,
-            tgt_project=args.project2,
-            fmt=args.format,
-            output_dir=args.output_dir,
-        )
+        if args.projects_file:
+            if args.project:
+                r_parser.error(
+                    "Do not provide project names when using --projects-file."
+                )
+            batch_compare_roles(
+                src_env=args.env,
+                tgt_env=args.env2,
+                projects_file=args.projects_file,
+                fmt=args.format,
+                output_dir=args.output_dir,
+            )
+        else:
+            if not args.project:
+                r_parser.error(
+                    "project is required unless --projects-file is given."
+                )
+            compare_roles(
+                src_env=args.env,
+                src_project=args.project,
+                tgt_env=args.env2,
+                tgt_project=args.project2 or args.project,
+                fmt=args.format,
+                output_dir=args.output_dir,
+            )
     elif args.command == "filters":
-        compare_filters(
-            src_env=args.env,
-            src_project=args.project,
-            tgt_env=args.env2,
-            tgt_project=args.project2,
-            fmt=args.format,
-            output_dir=args.output_dir,
-        )
+        if args.projects_file:
+            if args.project:
+                f_parser.error(
+                    "Do not provide project names when using --projects-file."
+                )
+            batch_compare_filters(
+                src_env=args.env,
+                tgt_env=args.env2,
+                projects_file=args.projects_file,
+                fmt=args.format,
+                output_dir=args.output_dir,
+            )
+        else:
+            if not args.project:
+                f_parser.error(
+                    "project is required unless --projects-file is given."
+                )
+            compare_filters(
+                src_env=args.env,
+                src_project=args.project,
+                tgt_env=args.env2,
+                tgt_project=args.project2 or args.project,
+                fmt=args.format,
+                output_dir=args.output_dir,
+            )
+    elif args.command == "apply-roles":
+        apply_roles(csv_path=args.csv_file, dry_run=args.dry_run)
+    elif args.command == "apply-filters":
+        apply_filters(csv_path=args.csv_file, dry_run=args.dry_run)
