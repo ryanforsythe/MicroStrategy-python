@@ -182,73 +182,107 @@ def _get_key_ids(table) -> set[str]:
     return key_ids
 
 
+def _extract_table(t) -> dict:
+    """Convert a single LogicalTable object into a normalised dict.
+
+    Accesses every lazy-loaded property eagerly so all server
+    round-trips happen while the connection is still alive.
+    Raises on server errors so callers can catch per-table failures.
+    """
+    # Force eager fetch of all properties we need — mstrio-py
+    # lazy-loads via __getattribute__ → fetch() on first access.
+    key_ids = _get_key_ids(t)
+
+    # ── Mapped objects (attributes + facts) ──────────────────────────
+    objects: list[dict] = []
+    for attr in getattr(t, "attributes", None) or []:
+        attr_id = str(getattr(attr, "id", ""))
+        objects.append(
+            {
+                "object_type": "Attribute",
+                "object_name": getattr(attr, "name", ""),
+                "object_id": attr_id,
+                "is_key": attr_id in key_ids,
+            }
+        )
+    for fact in getattr(t, "facts", None) or []:
+        objects.append(
+            {
+                "object_type": "Fact",
+                "object_name": getattr(fact, "name", ""),
+                "object_id": str(getattr(fact, "id", "")),
+                "is_key": "",
+            }
+        )
+
+    # ── Physical table ────────────────────────────────────────────────
+    pt = getattr(t, "physical_table", None)
+    pt_name = getattr(pt, "name", "") if pt else ""
+    pt_id = getattr(pt, "id", "") if pt else ""
+
+    return {
+        "table_id": t.id,
+        "table_name": t.name,
+        "description": t.description or "",
+        "sub_type": _safe_str(
+            getattr(t, "sub_type", getattr(t, "subtype", ""))
+        ),
+        "ext_type": _safe_str(getattr(t, "ext_type", "")),
+        "date_created": str(t.date_created) if t.date_created else "",
+        "date_modified": str(t.date_modified) if t.date_modified else "",
+        "location": getattr(t, "location", "") or "",
+        "is_logical_size_locked": getattr(
+            t, "is_logical_size_locked", ""
+        ),
+        "logical_size": getattr(t, "logical_size", ""),
+        "physical_table_name": pt_name,
+        "physical_table_id": pt_id,
+        "objects": objects,
+    }
+
+
 def _fetch_all_tables(conn, project_name: str) -> list[dict]:
     """Fetch all logical tables via mstrio-py and normalise to dicts.
 
-    Uses ``list_logical_tables()`` which returns fully-populated
-    LogicalTable objects.  Each object is flattened into a dict with
-    an ``objects`` list containing the mapped attributes and facts.
+    ``list_logical_tables()`` returns lightweight stub objects — most
+    properties are lazy-loaded via ``__getattribute__`` → ``fetch()``.
+    We eagerly extract every needed property while the connection is
+    active and wrap each table in a try/except so a single server
+    error (e.g. JWT expiry) does not abort the entire run.
     """
     logger.info("Fetching logical tables for project {p!r} ...", p=project_name)
     tables = list_logical_tables(conn, project_name=project_name)
     logger.info("Found {n} logical tables", n=len(tables))
 
     result: list[dict] = []
-    for t in sorted(tables, key=lambda x: x.name.lower()):
-        key_ids = _get_key_ids(t)
-
-        # ── Mapped objects (attributes + facts) ──────────────────────────
-        objects: list[dict] = []
-        for attr in getattr(t, "attributes", None) or []:
-            attr_id = str(getattr(attr, "id", ""))
-            objects.append(
-                {
-                    "object_type": "Attribute",
-                    "object_name": getattr(attr, "name", ""),
-                    "object_id": attr_id,
-                    "is_key": attr_id in key_ids,
-                }
+    errors = 0
+    total = len(tables)
+    for i, t in enumerate(sorted(tables, key=lambda x: x.name.lower()), 1):
+        try:
+            result.append(_extract_table(t))
+        except Exception as e:
+            errors += 1
+            logger.warning(
+                "Skipping table {name!r} (ID: {id}): {err}",
+                name=getattr(t, "name", "?"),
+                id=getattr(t, "id", "?"),
+                err=e,
             )
-        for fact in getattr(t, "facts", None) or []:
-            objects.append(
-                {
-                    "object_type": "Fact",
-                    "object_name": getattr(fact, "name", ""),
-                    "object_id": str(getattr(fact, "id", "")),
-                    "is_key": "",
-                }
+        if i % 50 == 0 or i == total:
+            logger.info(
+                "Processing table definitions: {i}/{n}", i=i, n=total
             )
 
-        # ── Physical table ────────────────────────────────────────────────
-        pt = getattr(t, "physical_table", None)
-        pt_name = getattr(pt, "name", "") if pt else ""
-        pt_id = getattr(pt, "id", "") if pt else ""
-
-        result.append(
-            {
-                "table_id": t.id,
-                "table_name": t.name,
-                "description": t.description or "",
-                "sub_type": _safe_str(
-                    getattr(t, "sub_type", getattr(t, "subtype", ""))
-                ),
-                "ext_type": _safe_str(getattr(t, "ext_type", "")),
-                "date_created": str(t.date_created) if t.date_created else "",
-                "date_modified": str(t.date_modified) if t.date_modified else "",
-                "location": getattr(t, "location", "") or "",
-                "is_logical_size_locked": getattr(
-                    t, "is_logical_size_locked", ""
-                ),
-                "logical_size": getattr(t, "logical_size", ""),
-                "physical_table_name": pt_name,
-                "physical_table_id": pt_id,
-                "objects": objects,
-            }
+    if errors:
+        logger.warning(
+            "{errors} of {total} tables could not be read — see warnings above",
+            errors=errors,
+            total=total,
         )
-
     logger.info(
-        "Processed {n} logical tables for project {p!r}",
+        "Processed {n}/{total} logical tables for project {p!r}",
         n=len(result),
+        total=total,
         p=project_name,
     )
     return result
