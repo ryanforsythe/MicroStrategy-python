@@ -50,9 +50,8 @@ from pathlib import Path
 
 import pandas as pd
 from loguru import logger
-from mstrio.modeling.schema import list_logical_tables
 
-from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
+from mstrio_core import MstrConfig, MstrRestSession, object_location, write_csv
 from mstrio_core.config import MstrEnvironment
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -167,12 +166,8 @@ def _write_excel_multi(
 # ── mstrio-py data fetching ──────────────────────────────────────────────────
 
 
-def _get_key_ids(table) -> set[str]:
-    """Return the set of attribute IDs that form the table key.
-
-    Uses ``table_key`` which contains SchemaObjectReference objects.
-    SchemaObjectReference uses ``.object_id``; Attribute objects use ``.id``.
-    """
+def _get_key_ids_sdk(table) -> set[str]:
+    """Return key attribute IDs from an mstrio-py LogicalTable object."""
     key_ids: set[str] = set()
     for tk in getattr(table, "table_key", None) or []:
         # SchemaObjectReference → .object_id; fallback → .id
@@ -182,16 +177,14 @@ def _get_key_ids(table) -> set[str]:
     return key_ids
 
 
-def _extract_table(t) -> dict:
-    """Convert a single LogicalTable object into a normalised dict.
+def _extract_table_sdk(t) -> dict:
+    """Convert a single mstrio-py LogicalTable object into a normalised dict.
 
     Accesses every lazy-loaded property eagerly so all server
     round-trips happen while the connection is still alive.
     Raises on server errors so callers can catch per-table failures.
     """
-    # Force eager fetch of all properties we need — mstrio-py
-    # lazy-loads via __getattribute__ → fetch() on first access.
-    key_ids = _get_key_ids(t)
+    key_ids = _get_key_ids_sdk(t)
 
     # ── Mapped objects (attributes + facts) ──────────────────────────
     objects: list[dict] = []
@@ -241,7 +234,7 @@ def _extract_table(t) -> dict:
     }
 
 
-def _fetch_all_tables(conn, project_name: str) -> list[dict]:
+def _fetch_all_tables_sdk(conn, project_name: str) -> list[dict]:
     """Fetch all logical tables via mstrio-py and normalise to dicts.
 
     ``list_logical_tables()`` returns lightweight stub objects — most
@@ -250,7 +243,9 @@ def _fetch_all_tables(conn, project_name: str) -> list[dict]:
     active and wrap each table in a try/except so a single server
     error (e.g. JWT expiry) does not abort the entire run.
     """
-    logger.info("Fetching logical tables for project {p!r} ...", p=project_name)
+    from mstrio.modeling.schema import list_logical_tables
+
+    logger.info("Fetching logical tables for project {p!r} (mstrio-py) ...", p=project_name)
     tables = list_logical_tables(conn, project_name=project_name)
     logger.info("Found {n} logical tables", n=len(tables))
 
@@ -259,7 +254,7 @@ def _fetch_all_tables(conn, project_name: str) -> list[dict]:
     total = len(tables)
     for i, t in enumerate(sorted(tables, key=lambda x: x.name.lower()), 1):
         try:
-            result.append(_extract_table(t))
+            result.append(_extract_table_sdk(t))
         except Exception as e:
             errors += 1
             logger.warning(
@@ -286,6 +281,190 @@ def _fetch_all_tables(conn, project_name: str) -> list[dict]:
         p=project_name,
     )
     return result
+
+
+# ── REST API fallback ────────────────────────────────────────────────────────
+
+
+def _search_tables_rest(session: MstrRestSession) -> list[dict]:
+    """Search for all logical tables (type 15) in the current project."""
+    results: list[dict] = []
+    offset = 0
+    limit = 1000
+    while True:
+        r = session.get(
+            "/searches/results",
+            params={
+                "type": 15,
+                "getAncestors": True,
+                "offset": offset,
+                "limit": limit,
+            },
+        )
+        r.raise_for_status()
+        data = r.json()
+        batch = data.get("result", [])
+        results.extend(batch)
+        total = data.get("totalItems", len(results))
+        if len(results) >= total or not batch:
+            break
+        offset += len(batch)
+    logger.info("Search found {n} logical tables", n=len(results))
+    return results
+
+
+def _fetch_table_definition_rest(
+    session: MstrRestSession, table_id: str
+) -> dict | None:
+    """Fetch the full modeling definition for one logical table via REST."""
+    try:
+        r = session.get(f"/model/tables/{table_id}")
+        r.raise_for_status()
+        logger.debug(
+            "Fetched table {id}: HTTP {s}", id=table_id, s=r.status_code
+        )
+        return r.json()
+    except Exception as e:
+        logger.warning(
+            "Failed to fetch table definition {id}: {err}", id=table_id, err=e
+        )
+        return None
+
+
+def _extract_key_ids_rest(table_def: dict) -> set[str]:
+    """Return the set of attribute object-IDs from the REST tableKey array."""
+    key_list = table_def.get("tableKey", [])
+    return {
+        k.get("objectId", k.get("id", ""))
+        for k in key_list
+        if isinstance(k, dict)
+    }
+
+
+def _fetch_all_tables_rest(session: MstrRestSession) -> list[dict]:
+    """Fetch all logical tables via REST API (search + model/tables).
+
+    Used as fallback when mstrio-py list_logical_tables() is not
+    supported by the target I-Server version.
+    """
+    search_results = _search_tables_rest(session)
+    if not search_results:
+        return []
+
+    # Build a location map from search ancestors
+    location_map: dict[str, str] = {}
+    for sr in search_results:
+        tid = sr.get("id", "")
+        ancestors = sr.get("ancestors", [])
+        location_map[tid] = object_location(ancestors) if ancestors else ""
+
+    tables: list[dict] = []
+    total = len(search_results)
+    for i, sr in enumerate(search_results, 1):
+        tid = sr.get("id", "")
+        name = sr.get("name", "")
+
+        if i % 50 == 0 or i == total:
+            logger.info(
+                "Fetching table definitions (REST): {i}/{n}", i=i, n=total
+            )
+
+        tdef = _fetch_table_definition_rest(session, tid)
+        if tdef is None:
+            continue
+
+        info = tdef.get("information", {})
+        phys = tdef.get("physicalTable", {})
+        phys_info = phys.get("information", {}) if isinstance(phys, dict) else {}
+
+        # Determine key attributes
+        key_ids = _extract_key_ids_rest(tdef)
+
+        # Build objects list (attributes + facts)
+        objects: list[dict] = []
+        for attr in tdef.get("attributes", []):
+            ai = attr.get("information", {})
+            aid = ai.get("objectId", "")
+            objects.append(
+                {
+                    "object_type": "Attribute",
+                    "object_name": ai.get("name", ""),
+                    "object_id": aid,
+                    "is_key": aid in key_ids,
+                }
+            )
+        for fact in tdef.get("facts", []):
+            fi = fact.get("information", {})
+            objects.append(
+                {
+                    "object_type": "Fact",
+                    "object_name": fi.get("name", ""),
+                    "object_id": fi.get("objectId", ""),
+                    "is_key": "",
+                }
+            )
+
+        tables.append(
+            {
+                "table_id": tid,
+                "table_name": name,
+                "description": info.get(
+                    "description", sr.get("description", "")
+                ),
+                "sub_type": info.get("subType", sr.get("subtype", "")),
+                "ext_type": info.get("extType", sr.get("extType", "")),
+                "date_created": info.get(
+                    "dateCreated", sr.get("dateCreated", "")
+                ),
+                "date_modified": info.get(
+                    "dateModified", sr.get("dateModified", "")
+                ),
+                "location": location_map.get(tid, ""),
+                "is_logical_size_locked": tdef.get(
+                    "isLogicalSizeLocked", ""
+                ),
+                "logical_size": tdef.get("logicalSize", ""),
+                "physical_table_name": phys_info.get("name", ""),
+                "physical_table_id": phys_info.get("objectId", ""),
+                "objects": objects,
+            }
+        )
+
+    logger.info(
+        "Retrieved {n}/{total} table definitions via REST",
+        n=len(tables),
+        total=total,
+    )
+    return sorted(tables, key=lambda t: t["table_name"].lower())
+
+
+# ── Unified fetch (SDK → REST fallback) ──────────────────────────────────────
+
+
+def _fetch_all_tables(session: MstrRestSession, project_name: str) -> list[dict]:
+    """Fetch all logical tables, trying mstrio-py SDK first, REST API as fallback.
+
+    The mstrio-py ``list_logical_tables()`` may fail on older I-Server
+    versions or when the modeling service is unreachable.  In that case
+    we fall back to REST API discovery (``GET /searches/results?type=15``)
+    plus per-table detail fetch (``GET /model/tables/{id}``).
+    """
+    # ── Try mstrio-py SDK first ───────────────────────────────────────────
+    try:
+        conn = session.mstrio_conn
+        return _fetch_all_tables_sdk(conn, project_name)
+    except Exception as sdk_err:
+        logger.warning(
+            "mstrio-py list_logical_tables() failed: {err}  — falling back to REST API",
+            err=sdk_err,
+        )
+
+    # ── Fallback: REST API ────────────────────────────────────────────────
+    logger.info(
+        "Fetching logical tables for project {p!r} via REST API ...",
+        p=project_name,
+    )
+    return _fetch_all_tables_rest(session)
 
 
 # ── Row builders ──────────────────────────────────────────────────────────────
@@ -627,41 +806,40 @@ def export_tables(
 ) -> None:
     """Export all logical tables and their mapped objects from a project."""
     config = _make_config(env)
-    conn = get_mstrio_connection(config=config)
-    try:
-        tables = _fetch_all_tables(conn, project)
 
-        if not tables:
-            logger.warning(
-                "No logical tables found in {project!r}.", project=project
-            )
-            return
+    with MstrRestSession(config) as session:
+        session.set_project(name=project)
+        tables = _fetch_all_tables(session, project)
 
-        table_rows = _build_table_rows(tables)
-        object_rows = _build_object_rows(tables)
-
-        logger.info(
-            "{tn} tables, {on} mapped objects",
-            tn=len(table_rows),
-            on=len(object_rows),
+    if not tables:
+        logger.warning(
+            "No logical tables found in {project!r}.", project=project
         )
+        return
 
-        safe_project = project.replace(" ", "_").replace("/", "-")
-        out = _out_dir(config, output_dir)
-        stem = f"logical_tables_{safe_project}_{env}"
+    table_rows = _build_table_rows(tables)
+    object_rows = _build_object_rows(tables)
 
-        _write_output(
-            table_rows,
-            _TABLES_CSV_COLS,
-            object_rows,
-            _OBJECTS_CSV_COLS,
-            fmt,
-            stem,
-            out,
-            json_data=tables,  # nested for JSON
-        )
-    finally:
-        conn.close()
+    logger.info(
+        "{tn} tables, {on} mapped objects",
+        tn=len(table_rows),
+        on=len(object_rows),
+    )
+
+    safe_project = project.replace(" ", "_").replace("/", "-")
+    out = _out_dir(config, output_dir)
+    stem = f"logical_tables_{safe_project}_{env}"
+
+    _write_output(
+        table_rows,
+        _TABLES_CSV_COLS,
+        object_rows,
+        _OBJECTS_CSV_COLS,
+        fmt,
+        stem,
+        out,
+        json_data=tables,  # nested for JSON
+    )
 
 
 def compare_tables(
@@ -683,22 +861,21 @@ def compare_tables(
 
     # ── Source ─────────────────────────────────────────────────────────────
     src_config = _make_config(src_env)
-    src_conn = get_mstrio_connection(config=src_config)
-    try:
-        src_tables = _fetch_all_tables(src_conn, src_project)
+    with MstrRestSession(src_config) as session:
+        session.set_project(name=src_project)
+        src_tables = _fetch_all_tables(session, src_project)
+
+        # If same environment, fetch target on the same session
         if same_env:
-            tgt_tables = _fetch_all_tables(src_conn, tgt_project)
-    finally:
-        src_conn.close()
+            session.set_project(name=tgt_project)
+            tgt_tables = _fetch_all_tables(session, tgt_project)
 
     # ── Target (cross-environment) ────────────────────────────────────────
     if not same_env:
         tgt_config = _make_config(tgt_env)
-        tgt_conn = get_mstrio_connection(config=tgt_config)
-        try:
-            tgt_tables = _fetch_all_tables(tgt_conn, tgt_project)
-        finally:
-            tgt_conn.close()
+        with MstrRestSession(tgt_config) as session:
+            session.set_project(name=tgt_project)
+            tgt_tables = _fetch_all_tables(session, tgt_project)
 
     # ── Diff ──────────────────────────────────────────────────────────────
     logger.info(
