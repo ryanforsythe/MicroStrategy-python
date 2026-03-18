@@ -1,0 +1,812 @@
+"""
+LogicalTables.py — Export and compare MicroStrategy logical table definitions.
+
+Subcommands
+───────────
+  export  — Document all logical tables in a project.  Outputs table metadata
+             (ID, name, type, physical table, logical size …) and the
+             attributes / facts mapped to each table with key indicators.
+
+  compare — Compare logical tables between two projects (same or different
+             environments).  By default shows only differences; pass --all to
+             include matching tables/objects.
+
+Output formats
+──────────────
+  csv   — Two files: *_tables.csv + *_objects.csv  (default)
+  json  — Single nested file
+  excel — Single workbook with Tables + TableObjects sheets
+
+Usage
+─────
+  python LogicalTables.py export  <env> <project>
+                                  [--format csv|json|excel] [--output-dir PATH]
+
+  python LogicalTables.py compare <env> <project> <env2> [<project2>]
+                                  [--all] [--format csv|json|excel]
+                                  [--output-dir PATH]
+
+Examples
+────────
+  # Export all tables in "My Project" on dev
+  python LogicalTables.py export dev "My Project"
+
+  # Export to Excel (2 sheets)
+  python LogicalTables.py export dev "My Project" --format excel
+
+  # Compare tables between dev and qa (same project name)
+  python LogicalTables.py compare dev "My Project" qa
+
+  # Compare different projects on the same environment
+  python LogicalTables.py compare prod "Project A" prod "Project B"
+
+  # Compare — show all tables including matches
+  python LogicalTables.py compare dev "My Project" qa --all
+"""
+
+import argparse
+import json as _json
+from pathlib import Path
+
+import pandas as pd
+from loguru import logger
+from mstrio.modeling.schema import list_logical_tables
+
+from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
+from mstrio_core.config import MstrEnvironment
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+ENVS = [e.value for e in MstrEnvironment]
+
+_TABLES_CSV_COLS = [
+    "table_id",
+    "table_name",
+    "description",
+    "sub_type",
+    "ext_type",
+    "date_created",
+    "date_modified",
+    "location",
+    "is_logical_size_locked",
+    "logical_size",
+    "physical_table_name",
+    "physical_table_id",
+]
+
+_OBJECTS_CSV_COLS = [
+    "table_id",
+    "table_name",
+    "object_type",
+    "object_name",
+    "object_id",
+    "is_key",
+]
+
+_CMP_TABLES_CSV_COLS = [
+    "table_name",
+    "source_table_id",
+    "target_table_id",
+    "source_is_locked",
+    "target_is_locked",
+    "locked_match",
+    "source_logical_size",
+    "target_logical_size",
+    "size_match",
+    "source_env",
+    "source_project",
+    "target_env",
+    "target_project",
+    "status",
+]
+
+_CMP_OBJECTS_CSV_COLS = [
+    "table_name",
+    "object_type",
+    "object_name",
+    "source_object_id",
+    "target_object_id",
+    "source_is_key",
+    "target_is_key",
+    "is_key_match",
+    "source_env",
+    "source_project",
+    "target_env",
+    "target_project",
+    "status",
+]
+
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+
+def _make_config(env: str) -> MstrConfig:
+    return MstrConfig(environment=MstrEnvironment(env))
+
+
+def _out_dir(config: MstrConfig, output_dir: Path | None) -> Path:
+    d = output_dir or config.output_dir
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _dicts_to_rows(dicts: list[dict], columns: list[str]) -> list[list]:
+    return [[d.get(c, "") for c in columns] for d in dicts]
+
+
+def _safe_str(val) -> str:
+    """Convert mstrio enum/object values to clean strings.
+
+    Strips prefixes like 'ObjectSubType.LOGICAL_TABLE' → 'LOGICAL_TABLE'.
+    """
+    if val is None:
+        return ""
+    s = str(val)
+    for prefix in (
+        "ObjectTypes.",
+        "ObjectSubType.",
+        "ObjectSubTypes.",
+        "ExtendedType.",
+    ):
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    return s
+
+
+def _write_excel_multi(
+    sheets: dict[str, tuple[list[list], list[str]]], path: Path
+) -> None:
+    """Write multiple named sheets to a single Excel workbook."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        for sheet_name, (rows, columns) in sheets.items():
+            df = pd.DataFrame(rows, columns=columns)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    logger.success("Excel written: {path}", path=path)
+
+
+# ── mstrio-py data fetching ──────────────────────────────────────────────────
+
+
+def _get_key_ids(table) -> set[str]:
+    """Return the set of attribute IDs that form the table key.
+
+    Uses ``table_key`` which contains SchemaObjectReference objects.
+    SchemaObjectReference uses ``.object_id``; Attribute objects use ``.id``.
+    """
+    key_ids: set[str] = set()
+    for tk in getattr(table, "table_key", None) or []:
+        # SchemaObjectReference → .object_id; fallback → .id
+        oid = getattr(tk, "object_id", None) or getattr(tk, "id", None)
+        if oid:
+            key_ids.add(str(oid))
+    return key_ids
+
+
+def _fetch_all_tables(conn, project_name: str) -> list[dict]:
+    """Fetch all logical tables via mstrio-py and normalise to dicts.
+
+    Uses ``list_logical_tables()`` which returns fully-populated
+    LogicalTable objects.  Each object is flattened into a dict with
+    an ``objects`` list containing the mapped attributes and facts.
+    """
+    logger.info("Fetching logical tables for project {p!r} ...", p=project_name)
+    tables = list_logical_tables(conn, project_name=project_name)
+    logger.info("Found {n} logical tables", n=len(tables))
+
+    result: list[dict] = []
+    for t in sorted(tables, key=lambda x: x.name.lower()):
+        key_ids = _get_key_ids(t)
+
+        # ── Mapped objects (attributes + facts) ──────────────────────────
+        objects: list[dict] = []
+        for attr in getattr(t, "attributes", None) or []:
+            attr_id = str(getattr(attr, "id", ""))
+            objects.append(
+                {
+                    "object_type": "Attribute",
+                    "object_name": getattr(attr, "name", ""),
+                    "object_id": attr_id,
+                    "is_key": attr_id in key_ids,
+                }
+            )
+        for fact in getattr(t, "facts", None) or []:
+            objects.append(
+                {
+                    "object_type": "Fact",
+                    "object_name": getattr(fact, "name", ""),
+                    "object_id": str(getattr(fact, "id", "")),
+                    "is_key": "",
+                }
+            )
+
+        # ── Physical table ────────────────────────────────────────────────
+        pt = getattr(t, "physical_table", None)
+        pt_name = getattr(pt, "name", "") if pt else ""
+        pt_id = getattr(pt, "id", "") if pt else ""
+
+        result.append(
+            {
+                "table_id": t.id,
+                "table_name": t.name,
+                "description": t.description or "",
+                "sub_type": _safe_str(
+                    getattr(t, "sub_type", getattr(t, "subtype", ""))
+                ),
+                "ext_type": _safe_str(getattr(t, "ext_type", "")),
+                "date_created": str(t.date_created) if t.date_created else "",
+                "date_modified": str(t.date_modified) if t.date_modified else "",
+                "location": getattr(t, "location", "") or "",
+                "is_logical_size_locked": getattr(
+                    t, "is_logical_size_locked", ""
+                ),
+                "logical_size": getattr(t, "logical_size", ""),
+                "physical_table_name": pt_name,
+                "physical_table_id": pt_id,
+                "objects": objects,
+            }
+        )
+
+    logger.info(
+        "Processed {n} logical tables for project {p!r}",
+        n=len(result),
+        p=project_name,
+    )
+    return result
+
+
+# ── Row builders ──────────────────────────────────────────────────────────────
+
+
+def _build_table_rows(tables: list[dict]) -> list[dict]:
+    """Flatten tables to rows for the Tables sheet/CSV."""
+    rows = []
+    for t in tables:
+        rows.append(
+            {
+                "table_id": t["table_id"],
+                "table_name": t["table_name"],
+                "description": t["description"],
+                "sub_type": t["sub_type"],
+                "ext_type": t["ext_type"],
+                "date_created": t["date_created"],
+                "date_modified": t["date_modified"],
+                "location": t["location"],
+                "is_logical_size_locked": t["is_logical_size_locked"],
+                "logical_size": t["logical_size"],
+                "physical_table_name": t["physical_table_name"],
+                "physical_table_id": t["physical_table_id"],
+            }
+        )
+    return rows
+
+
+def _build_object_rows(tables: list[dict]) -> list[dict]:
+    """Flatten table objects to rows for the TableObjects sheet/CSV."""
+    rows = []
+    for t in tables:
+        for obj in t.get("objects", []):
+            rows.append(
+                {
+                    "table_id": t["table_id"],
+                    "table_name": t["table_name"],
+                    "object_type": obj["object_type"],
+                    "object_name": obj["object_name"],
+                    "object_id": obj["object_id"],
+                    "is_key": obj["is_key"],
+                }
+            )
+    return rows
+
+
+# ── Compare logic ─────────────────────────────────────────────────────────────
+
+
+def _diff_tables(
+    src_tables: list[dict],
+    tgt_tables: list[dict],
+    src_env: str,
+    src_project: str,
+    tgt_env: str,
+    tgt_project: str,
+    show_all: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """
+    Compare logical tables and their objects between two projects.
+
+    Returns (table_diff_rows, object_diff_rows).
+    """
+    # Index by lowercase name
+    src_by_name = {t["table_name"].lower(): t for t in src_tables}
+    tgt_by_name = {t["table_name"].lower(): t for t in tgt_tables}
+    all_names = sorted(set(src_by_name.keys()) | set(tgt_by_name.keys()))
+
+    table_rows: list[dict] = []
+    object_rows: list[dict] = []
+
+    common = {"source_env": src_env, "source_project": src_project,
+              "target_env": tgt_env, "target_project": tgt_project}
+
+    for name in all_names:
+        src = src_by_name.get(name)
+        tgt = tgt_by_name.get(name)
+
+        if src and not tgt:
+            # ── Source only ───────────────────────────────────────────────
+            table_rows.append(
+                {
+                    "table_name": src["table_name"],
+                    "source_table_id": src["table_id"],
+                    "target_table_id": "",
+                    "source_is_locked": src["is_logical_size_locked"],
+                    "target_is_locked": "",
+                    "locked_match": "",
+                    "source_logical_size": src["logical_size"],
+                    "target_logical_size": "",
+                    "size_match": "",
+                    **common,
+                    "status": "source_only",
+                }
+            )
+            for obj in src.get("objects", []):
+                object_rows.append(
+                    {
+                        "table_name": src["table_name"],
+                        "object_type": obj["object_type"],
+                        "object_name": obj["object_name"],
+                        "source_object_id": obj["object_id"],
+                        "target_object_id": "",
+                        "source_is_key": obj["is_key"],
+                        "target_is_key": "",
+                        "is_key_match": "",
+                        **common,
+                        "status": "source_only",
+                    }
+                )
+
+        elif tgt and not src:
+            # ── Target only ───────────────────────────────────────────────
+            table_rows.append(
+                {
+                    "table_name": tgt["table_name"],
+                    "source_table_id": "",
+                    "target_table_id": tgt["table_id"],
+                    "source_is_locked": "",
+                    "target_is_locked": tgt["is_logical_size_locked"],
+                    "locked_match": "",
+                    "source_logical_size": "",
+                    "target_logical_size": tgt["logical_size"],
+                    "size_match": "",
+                    **common,
+                    "status": "target_only",
+                }
+            )
+            for obj in tgt.get("objects", []):
+                object_rows.append(
+                    {
+                        "table_name": tgt["table_name"],
+                        "object_type": obj["object_type"],
+                        "object_name": obj["object_name"],
+                        "source_object_id": "",
+                        "target_object_id": obj["object_id"],
+                        "source_is_key": "",
+                        "target_is_key": obj["is_key"],
+                        "is_key_match": "",
+                        **common,
+                        "status": "target_only",
+                    }
+                )
+
+        else:
+            # ── Both exist — compare properties ───────────────────────────
+            locked_match = (
+                src["is_logical_size_locked"] == tgt["is_logical_size_locked"]
+            )
+            size_match = src["logical_size"] == tgt["logical_size"]
+
+            if locked_match and size_match:
+                tbl_status = "match"
+            else:
+                tbl_status = "differs"
+
+            if show_all or tbl_status != "match":
+                table_rows.append(
+                    {
+                        "table_name": src["table_name"],
+                        "source_table_id": src["table_id"],
+                        "target_table_id": tgt["table_id"],
+                        "source_is_locked": src["is_logical_size_locked"],
+                        "target_is_locked": tgt["is_logical_size_locked"],
+                        "locked_match": locked_match,
+                        "source_logical_size": src["logical_size"],
+                        "target_logical_size": tgt["logical_size"],
+                        "size_match": size_match,
+                        **common,
+                        "status": tbl_status,
+                    }
+                )
+
+            # ── Compare objects within this table ─────────────────────────
+            src_objs = {
+                (o["object_type"].lower(), o["object_name"].lower()): o
+                for o in src.get("objects", [])
+            }
+            tgt_objs = {
+                (o["object_type"].lower(), o["object_name"].lower()): o
+                for o in tgt.get("objects", [])
+            }
+            all_obj_keys = sorted(
+                set(src_objs.keys()) | set(tgt_objs.keys())
+            )
+
+            for ok in all_obj_keys:
+                so = src_objs.get(ok)
+                to = tgt_objs.get(ok)
+
+                if so and not to:
+                    object_rows.append(
+                        {
+                            "table_name": src["table_name"],
+                            "object_type": so["object_type"],
+                            "object_name": so["object_name"],
+                            "source_object_id": so["object_id"],
+                            "target_object_id": "",
+                            "source_is_key": so["is_key"],
+                            "target_is_key": "",
+                            "is_key_match": "",
+                            **common,
+                            "status": "source_only",
+                        }
+                    )
+                elif to and not so:
+                    object_rows.append(
+                        {
+                            "table_name": src["table_name"],
+                            "object_type": to["object_type"],
+                            "object_name": to["object_name"],
+                            "source_object_id": "",
+                            "target_object_id": to["object_id"],
+                            "source_is_key": "",
+                            "target_is_key": to["is_key"],
+                            "is_key_match": "",
+                            **common,
+                            "status": "target_only",
+                        }
+                    )
+                else:
+                    # Both exist
+                    if so["object_type"] == "Attribute":
+                        key_match = so["is_key"] == to["is_key"]
+                        obj_status = "match" if key_match else "key_differs"
+                    else:
+                        key_match = ""
+                        obj_status = "match"
+
+                    if show_all or obj_status != "match":
+                        object_rows.append(
+                            {
+                                "table_name": src["table_name"],
+                                "object_type": so["object_type"],
+                                "object_name": so["object_name"],
+                                "source_object_id": so["object_id"],
+                                "target_object_id": to["object_id"],
+                                "source_is_key": so["is_key"],
+                                "target_is_key": to["is_key"],
+                                "is_key_match": key_match,
+                                **common,
+                                "status": obj_status,
+                            }
+                        )
+
+    return table_rows, object_rows
+
+
+# ── Output helpers ────────────────────────────────────────────────────────────
+
+
+def _write_output(
+    table_rows: list[dict],
+    table_cols: list[str],
+    object_rows: list[dict],
+    object_cols: list[str],
+    fmt: str,
+    stem: str,
+    out: Path,
+    *,
+    json_data: list[dict] | None = None,
+) -> None:
+    """
+    Write table and object rows in the requested format.
+
+    Args:
+        table_rows / object_rows: Flat dicts for each output set.
+        table_cols / object_cols: Column order.
+        fmt:       "csv", "json", or "excel".
+        stem:      Base filename without extension.
+        out:       Output directory.
+        json_data: Nested structure for JSON output (uses table_rows if None).
+    """
+    if fmt == "csv":
+        tp = out / f"{stem}_tables.csv"
+        write_csv(
+            _dicts_to_rows(table_rows, table_cols),
+            columns=table_cols,
+            path=tp,
+        )
+        op = out / f"{stem}_objects.csv"
+        write_csv(
+            _dicts_to_rows(object_rows, object_cols),
+            columns=object_cols,
+            path=op,
+        )
+        logger.success(
+            "Wrote {tn} table rows → {tp}  |  {on} object rows → {op}",
+            tn=len(table_rows),
+            tp=tp,
+            on=len(object_rows),
+            op=op,
+        )
+
+    elif fmt == "json":
+        jp = out / f"{stem}.json"
+        payload = json_data if json_data is not None else table_rows
+        jp.write_text(
+            _json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
+        logger.success("JSON written → {path}", path=jp)
+
+    elif fmt == "excel":
+        ep = out / f"{stem}.xlsx"
+        _write_excel_multi(
+            {
+                "Tables": (
+                    _dicts_to_rows(table_rows, table_cols),
+                    table_cols,
+                ),
+                "TableObjects": (
+                    _dicts_to_rows(object_rows, object_cols),
+                    object_cols,
+                ),
+            },
+            ep,
+        )
+        logger.success(
+            "Excel written: {tn} table rows + {on} object rows → {path}",
+            tn=len(table_rows),
+            on=len(object_rows),
+            path=ep,
+        )
+
+    else:
+        raise ValueError(
+            f"Unsupported format {fmt!r}. Use 'csv', 'json', or 'excel'."
+        )
+
+
+# ── Operations ────────────────────────────────────────────────────────────────
+
+
+def export_tables(
+    env: str,
+    project: str,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """Export all logical tables and their mapped objects from a project."""
+    config = _make_config(env)
+    conn = get_mstrio_connection(config=config)
+    try:
+        tables = _fetch_all_tables(conn, project)
+
+        if not tables:
+            logger.warning(
+                "No logical tables found in {project!r}.", project=project
+            )
+            return
+
+        table_rows = _build_table_rows(tables)
+        object_rows = _build_object_rows(tables)
+
+        logger.info(
+            "{tn} tables, {on} mapped objects",
+            tn=len(table_rows),
+            on=len(object_rows),
+        )
+
+        safe_project = project.replace(" ", "_").replace("/", "-")
+        out = _out_dir(config, output_dir)
+        stem = f"logical_tables_{safe_project}_{env}"
+
+        _write_output(
+            table_rows,
+            _TABLES_CSV_COLS,
+            object_rows,
+            _OBJECTS_CSV_COLS,
+            fmt,
+            stem,
+            out,
+            json_data=tables,  # nested for JSON
+        )
+    finally:
+        conn.close()
+
+
+def compare_tables(
+    src_env: str,
+    src_project: str,
+    tgt_env: str,
+    tgt_project: str,
+    show_all: bool = False,
+    fmt: str = "csv",
+    output_dir: Path | None = None,
+) -> None:
+    """
+    Compare logical tables between two projects.
+
+    Compares table properties (is_logical_size_locked, logical_size) and
+    mapped objects (attributes/facts, is_key for attributes).
+    """
+    same_env = src_env == tgt_env
+
+    # ── Source ─────────────────────────────────────────────────────────────
+    src_config = _make_config(src_env)
+    src_conn = get_mstrio_connection(config=src_config)
+    try:
+        src_tables = _fetch_all_tables(src_conn, src_project)
+        if same_env:
+            tgt_tables = _fetch_all_tables(src_conn, tgt_project)
+    finally:
+        src_conn.close()
+
+    # ── Target (cross-environment) ────────────────────────────────────────
+    if not same_env:
+        tgt_config = _make_config(tgt_env)
+        tgt_conn = get_mstrio_connection(config=tgt_config)
+        try:
+            tgt_tables = _fetch_all_tables(tgt_conn, tgt_project)
+        finally:
+            tgt_conn.close()
+
+    # ── Diff ──────────────────────────────────────────────────────────────
+    logger.info(
+        "Source: {sn} tables  |  Target: {tn} tables",
+        sn=len(src_tables),
+        tn=len(tgt_tables),
+    )
+
+    table_diff, object_diff = _diff_tables(
+        src_tables,
+        tgt_tables,
+        src_env,
+        src_project,
+        tgt_env,
+        tgt_project,
+        show_all=show_all,
+    )
+
+    if not table_diff and not object_diff:
+        logger.info("No differences found between the projects.")
+        return
+
+    # ── Summarise ─────────────────────────────────────────────────────────
+    tbl_src_only = sum(1 for r in table_diff if r["status"] == "source_only")
+    tbl_tgt_only = sum(1 for r in table_diff if r["status"] == "target_only")
+    tbl_differs = sum(1 for r in table_diff if r["status"] == "differs")
+    tbl_match = sum(1 for r in table_diff if r["status"] == "match")
+    obj_src_only = sum(1 for r in object_diff if r["status"] == "source_only")
+    obj_tgt_only = sum(1 for r in object_diff if r["status"] == "target_only")
+    obj_key_diff = sum(1 for r in object_diff if r["status"] == "key_differs")
+
+    logger.info(
+        "Tables — source_only: {so}, target_only: {to}, differs: {d}, match: {m}",
+        so=tbl_src_only,
+        to=tbl_tgt_only,
+        d=tbl_differs,
+        m=tbl_match,
+    )
+    logger.info(
+        "Objects — source_only: {so}, target_only: {to}, key_differs: {kd}",
+        so=obj_src_only,
+        to=obj_tgt_only,
+        kd=obj_key_diff,
+    )
+
+    # ── Write output ──────────────────────────────────────────────────────
+    safe_src = src_project.replace(" ", "_").replace("/", "-")
+    safe_tgt = tgt_project.replace(" ", "_").replace("/", "-")
+    suffix = "all" if show_all else "diff"
+    out = _out_dir(src_config, output_dir)
+    stem = f"logical_tables_compare_{safe_src}_{src_env}_vs_{safe_tgt}_{tgt_env}_{suffix}"
+
+    _write_output(
+        table_diff,
+        _CMP_TABLES_CSV_COLS,
+        object_diff,
+        _CMP_OBJECTS_CSV_COLS,
+        fmt,
+        stem,
+        out,
+    )
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Export and compare MicroStrategy logical table definitions.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            '  python LogicalTables.py export dev "My Project"\n'
+            '  python LogicalTables.py export dev "My Project" --format excel\n'
+            '  python LogicalTables.py compare dev "My Project" qa\n'
+            '  python LogicalTables.py compare prod "Project A" prod "Project B"\n'
+            '  python LogicalTables.py compare dev "My Project" qa --all\n'
+        ),
+    )
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── export ────────────────────────────────────────────────────────────
+    exp = sub.add_parser(
+        "export",
+        help="Document all logical tables in a project.",
+    )
+    exp.add_argument("env", choices=ENVS, help="Environment (dev, qa, prod).")
+    exp.add_argument("project", help="Project name.")
+    exp.add_argument(
+        "--format",
+        choices=["csv", "json", "excel"],
+        default="csv",
+        help="Output format (default: csv).",
+    )
+    exp.add_argument("--output-dir", type=Path, default=None, metavar="PATH")
+
+    # ── compare ───────────────────────────────────────────────────────────
+    cmp = sub.add_parser(
+        "compare",
+        help="Compare logical tables between two projects.",
+    )
+    cmp.add_argument("env", choices=ENVS, help="Source environment.")
+    cmp.add_argument("project", help="Source project name.")
+    cmp.add_argument("env2", choices=ENVS, help="Target environment.")
+    cmp.add_argument(
+        "project2",
+        nargs="?",
+        default=None,
+        help="Target project name (default: same as source).",
+    )
+    cmp.add_argument(
+        "--all",
+        dest="show_all",
+        action="store_true",
+        default=False,
+        help="Include matching tables/objects (default: differences only).",
+    )
+    cmp.add_argument(
+        "--format",
+        choices=["csv", "json", "excel"],
+        default="csv",
+        help="Output format (default: csv).",
+    )
+    cmp.add_argument("--output-dir", type=Path, default=None, metavar="PATH")
+
+    # ── Dispatch ──────────────────────────────────────────────────────────
+    args = parser.parse_args()
+
+    if args.command == "export":
+        export_tables(
+            env=args.env,
+            project=args.project,
+            fmt=args.format,
+            output_dir=args.output_dir,
+        )
+    elif args.command == "compare":
+        compare_tables(
+            src_env=args.env,
+            src_project=args.project,
+            tgt_env=args.env2,
+            tgt_project=args.project2 or args.project,
+            show_all=args.show_all,
+            fmt=args.format,
+            output_dir=args.output_dir,
+        )
