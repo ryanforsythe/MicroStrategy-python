@@ -234,6 +234,16 @@ def _extract_table_sdk(t) -> dict:
     }
 
 
+# Maximum consecutive per-table failures before aborting the SDK path
+# and falling back to REST.  Avoids waiting for N × timeout_seconds
+# when the I-Server modeling service is unreachable.
+_SDK_CONSECUTIVE_FAIL_LIMIT = 3
+
+
+class _SdkFetchAborted(Exception):
+    """Raised when the SDK path hits too many consecutive failures."""
+
+
 def _fetch_all_tables_sdk(conn, project_name: str) -> list[dict]:
     """Fetch all logical tables via mstrio-py and normalise to dicts.
 
@@ -242,6 +252,11 @@ def _fetch_all_tables_sdk(conn, project_name: str) -> list[dict]:
     We eagerly extract every needed property while the connection is
     active and wrap each table in a try/except so a single server
     error (e.g. JWT expiry) does not abort the entire run.
+
+    If ``_SDK_CONSECUTIVE_FAIL_LIMIT`` consecutive tables fail (e.g.
+    timeouts on an unreachable modeling service), raises
+    ``_SdkFetchAborted`` so the caller can switch to the REST fallback
+    immediately instead of waiting for every table to time out.
     """
     from mstrio.modeling.schema import list_logical_tables
 
@@ -251,18 +266,26 @@ def _fetch_all_tables_sdk(conn, project_name: str) -> list[dict]:
 
     result: list[dict] = []
     errors = 0
+    consecutive_errors = 0
     total = len(tables)
     for i, t in enumerate(sorted(tables, key=lambda x: x.name.lower()), 1):
         try:
             result.append(_extract_table_sdk(t))
+            consecutive_errors = 0  # reset on success
         except Exception as e:
             errors += 1
+            consecutive_errors += 1
             logger.warning(
                 "Skipping table {name!r} (ID: {id}): {err}",
                 name=getattr(t, "name", "?"),
                 id=getattr(t, "id", "?"),
                 err=e,
             )
+            if consecutive_errors >= _SDK_CONSECUTIVE_FAIL_LIMIT:
+                raise _SdkFetchAborted(
+                    f"{consecutive_errors} consecutive table fetches failed "
+                    f"(last: {e})"
+                ) from e
         if i % 50 == 0 or i == total:
             logger.info(
                 "Processing table definitions: {i}/{n}", i=i, n=total
@@ -448,14 +471,25 @@ def _fetch_all_tables(session: MstrRestSession, project_name: str) -> list[dict]
     versions or when the modeling service is unreachable.  In that case
     we fall back to REST API discovery (``GET /searches/results?type=15``)
     plus per-table detail fetch (``GET /model/tables/{id}``).
+
+    The SDK path also aborts early (via ``_SdkFetchAborted``) if
+    multiple consecutive per-table fetches time out, to avoid waiting
+    for every table to fail individually.
     """
     # ── Try mstrio-py SDK first ───────────────────────────────────────────
     try:
         conn = session.mstrio_conn
         return _fetch_all_tables_sdk(conn, project_name)
+    except _SdkFetchAborted as abort_err:
+        logger.warning(
+            "SDK per-table fetch aborted after consecutive failures: {err} "
+            "— switching to REST API",
+            err=abort_err,
+        )
     except Exception as sdk_err:
         logger.warning(
-            "mstrio-py list_logical_tables() failed: {err}  — falling back to REST API",
+            "mstrio-py list_logical_tables() failed: {err} "
+            "— falling back to REST API",
             err=sdk_err,
         )
 
