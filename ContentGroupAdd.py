@@ -6,6 +6,8 @@ Supports two input modes:
   2. Folder GUID — adds all non-hidden, non-folder contents; resolves shortcuts
      to their target objects
 
+Content groups accept: Dashboard, Document, Report.
+
 Usage
 ─────
   python ContentGroupAdd.py csv    <env> --content-group <name-or-id> --csv <path>
@@ -32,10 +34,12 @@ Examples
 
 import argparse
 import csv
-import json
 from pathlib import Path
 
 from loguru import logger
+from mstrio.project_objects import Dashboard, Document
+from mstrio.project_objects.content_group import ContentGroup, list_content_groups
+from mstrio.object_management import Report
 
 from mstrio_core import (
     MstrConfig,
@@ -54,6 +58,13 @@ ENVS = [e.value for e in MstrEnvironment]
 _SHORTCUT_TYPE = 18
 _FOLDER_TYPE = 8
 
+# Object types that ContentGroup accepts, mapped to mstrio-py classes.
+# Type 55 = Document/Dashboard, Type 3 = Report
+_CONTENT_TYPE_MAP = {
+    55: Dashboard,   # Dashboard is the modern form of type 55 (Dossier)
+    3: Report,
+}
+
 _OUTPUT_COLS = [
     "GUID", "Name", "Type", "TypeID", "Source", "Status",
 ]
@@ -62,28 +73,60 @@ _OUTPUT_COLS = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _resolve_content_group(session, name_or_id):
+def _set_project(session, config, project_name=None):
+    """Set the active project on the session."""
+    if project_name:
+        session.set_project(name=project_name)
+    elif config.project_name:
+        session.set_project(name=config.project_name)
+    elif config.project_id:
+        session.set_project(project_id=config.project_id)
+    else:
+        raise ValueError(
+            "No project specified. Use --project or set MSTR_PROJECT_NAME / MSTR_PROJECT_ID."
+        )
+
+
+def _resolve_content_group_sdk(conn, name_or_id):
     """
-    Resolve a content group by name or GUID.
+    Resolve a content group by name or GUID via mstrio-py SDK.
 
     Returns (id, name) tuple.
     """
     # Try by ID first (32-char hex)
     if len(name_or_id) == 32 and name_or_id.isalnum():
-        r = session.get(f"/contentGroups/{name_or_id}", scope="server")
-        if r.ok:
-            data = r.json()
-            return data["id"], data["name"]
-        logger.debug("Lookup by ID failed, trying as name.")
+        try:
+            cg = ContentGroup(connection=conn, id=name_or_id)
+            return cg.id, cg.name
+        except Exception:
+            logger.debug("Lookup by ID failed, trying as name.")
 
-    # List all and match by name
-    r = session.get("/contentGroups", scope="server")
-    r.raise_for_status()
-    for cg in r.json().get("contentGroups", r.json() if isinstance(r.json(), list) else []):
-        if cg.get("name") == name_or_id or cg.get("id") == name_or_id:
-            return cg["id"], cg["name"]
+    # Try by name
+    try:
+        cg = ContentGroup(connection=conn, name=name_or_id)
+        return cg.id, cg.name
+    except Exception:
+        pass
+
+    # Fall back to listing all and matching
+    all_cgs = list_content_groups(connection=conn)
+    for cg in all_cgs:
+        if cg.name == name_or_id or cg.id == name_or_id:
+            return cg.id, cg.name
 
     raise ValueError(f"Content group not found: {name_or_id!r}")
+
+
+def _make_content_object(conn, obj_id, obj_type):
+    """
+    Instantiate the appropriate mstrio-py object for ContentGroup.update_contents().
+
+    Returns the mstrio object, or None if the type is not supported by content groups.
+    """
+    cls = _CONTENT_TYPE_MAP.get(obj_type)
+    if cls is None:
+        return None
+    return cls(connection=conn, id=obj_id)
 
 
 def _read_guids_from_csv(csv_path):
@@ -238,25 +281,46 @@ def _resolve_object_types(session, guids):
     return results
 
 
-def _add_to_content_group(session, cg_id, project_id, objects, apply):
+def _add_to_content_group(conn, cg_id, cg_name, objects, apply):
     """
-    Add objects to a content group via REST API PATCH.
+    Add objects to a content group via mstrio-py ContentGroup.update_contents().
 
     Args:
-        session:    Authenticated MstrRestSession.
+        conn:       mstrio-py Connection (session.mstrio_conn).
         cg_id:      Content group GUID.
-        project_id: Project GUID for the content path.
-        objects:    List of dicts with 'id' and 'type' keys.
-        apply:      If False, dry-run only (no API call).
+        cg_name:    Content group name (for logging).
+        objects:    List of dicts with 'id', 'name', and 'type' keys.
+        apply:      If False, dry-run only (no SDK call).
 
     Returns:
         List of result dicts for reporting.
     """
     results = []
+    content_to_add = []
+    skipped = 0
 
-    if not apply:
-        for obj in objects:
-            type_name = OBJECT_TYPE_ID_MAP.get(obj["type"], str(obj["type"]))
+    for obj in objects:
+        type_name = OBJECT_TYPE_ID_MAP.get(obj["type"], str(obj["type"]))
+
+        mstrio_obj = _make_content_object(conn, obj["id"], obj["type"])
+        if mstrio_obj is None:
+            logger.warning(
+                "Skipping unsupported type for content group: "
+                "{name} ({id}, type={type_name}). "
+                "Content groups accept: Dashboard, Document, Report.",
+                name=obj.get("name", ""), id=obj["id"], type_name=type_name,
+            )
+            results.append({
+                "id": obj["id"],
+                "name": obj.get("name", ""),
+                "type_name": type_name,
+                "type_id": obj["type"],
+                "status": "SKIPPED (unsupported type)",
+            })
+            skipped += 1
+            continue
+
+        if not apply:
             results.append({
                 "id": obj["id"],
                 "name": obj.get("name", ""),
@@ -264,50 +328,47 @@ def _add_to_content_group(session, cg_id, project_id, objects, apply):
                 "type_id": obj["type"],
                 "status": "DRY-RUN",
             })
+        else:
+            content_to_add.append(mstrio_obj)
+            results.append({
+                "id": obj["id"],
+                "name": obj.get("name", ""),
+                "type_name": type_name,
+                "type_id": obj["type"],
+                "status": "PENDING",
+            })
+
+    if not apply:
+        if skipped:
+            logger.info(
+                "Dry-run: {n} object(s) would be added, {s} skipped (unsupported type)",
+                n=len(results) - skipped, s=skipped,
+            )
         return results
 
-    # Build the PATCH payload — batch all objects in one call
-    value_list = [{"id": obj["id"], "type": obj["type"]} for obj in objects]
+    if not content_to_add:
+        logger.warning("No supported objects to add after filtering.")
+        return results
 
-    payload = {
-        "operationList": [
-            {
-                "op": "add",
-                "path": f"/{project_id}",
-                "value": value_list,
-                "id": 1,
-            }
-        ]
-    }
-
-    r = session.patch(
-        f"/contentGroups/{cg_id}/contents",
-        scope="server",
-        json=payload,
-    )
-
-    if r.ok:
+    # Add via mstrio-py SDK
+    cg = ContentGroup(connection=conn, id=cg_id)
+    try:
+        cg.update_contents(content_to_add=content_to_add)
         logger.success(
-            "Added {n} object(s) to content group {cg}",
-            n=len(objects), cg=cg_id,
+            "Added {n} object(s) to content group '{name}' ({id})",
+            n=len(content_to_add), name=cg_name, id=cg_id,
         )
-        status = "ADDED"
-    else:
+        for r in results:
+            if r["status"] == "PENDING":
+                r["status"] = "ADDED"
+    except Exception as exc:
         logger.error(
-            "Failed to add objects: HTTP {status} — {body}",
-            status=r.status_code, body=r.text[:500],
+            "Failed to add objects to content group '{name}': {exc}",
+            name=cg_name, exc=exc,
         )
-        status = f"FAILED (HTTP {r.status_code})"
-
-    for obj in objects:
-        type_name = OBJECT_TYPE_ID_MAP.get(obj["type"], str(obj["type"]))
-        results.append({
-            "id": obj["id"],
-            "name": obj.get("name", ""),
-            "type_name": type_name,
-            "type_id": obj["type"],
-            "status": status,
-        })
+        for r in results:
+            if r["status"] == "PENDING":
+                r["status"] = f"FAILED ({exc})"
 
     return results
 
@@ -334,22 +395,11 @@ def cmd_csv(
         return
 
     with MstrRestSession(config) as session:
-        # Set project
-        if project:
-            session.set_project(name=project)
-        elif config.project_name:
-            session.set_project(name=config.project_name)
-        elif config.project_id:
-            session.set_project(project_id=config.project_id)
-        else:
-            raise ValueError(
-                "No project specified. Use --project or set MSTR_PROJECT_NAME / MSTR_PROJECT_ID."
-            )
-
-        project_id = session.project_id
+        _set_project(session, config, project)
+        conn = session.mstrio_conn
 
         # Resolve content group
-        cg_id, cg_name = _resolve_content_group(session, content_group)
+        cg_id, cg_name = _resolve_content_group_sdk(conn, content_group)
         logger.info(
             "Content group: {name} ({id})", name=cg_name, id=cg_id,
         )
@@ -371,7 +421,7 @@ def cmd_csv(
         mode = "APPLY" if apply else "DRY-RUN"
         logger.info("Mode: {mode}", mode=mode)
 
-        results = _add_to_content_group(session, cg_id, project_id, objects, apply)
+        results = _add_to_content_group(conn, cg_id, cg_name, objects, apply)
 
         # Write output
         rows = [
@@ -399,27 +449,16 @@ def cmd_folder(
     Path(out).mkdir(parents=True, exist_ok=True)
 
     with MstrRestSession(config) as session:
-        # Set project
-        if project:
-            session.set_project(name=project)
-        elif config.project_name:
-            session.set_project(name=config.project_name)
-        elif config.project_id:
-            session.set_project(project_id=config.project_id)
-        else:
-            raise ValueError(
-                "No project specified. Use --project or set MSTR_PROJECT_NAME / MSTR_PROJECT_ID."
-            )
-
-        project_id = session.project_id
+        _set_project(session, config, project)
+        conn = session.mstrio_conn
 
         # Resolve content group
-        cg_id, cg_name = _resolve_content_group(session, content_group)
+        cg_id, cg_name = _resolve_content_group_sdk(conn, content_group)
         logger.info(
             "Content group: {name} ({id})", name=cg_name, id=cg_id,
         )
 
-        # Get folder contents
+        # Get folder contents (REST API via mstrio_core)
         objects = _get_folder_objects(session, folder_id)
 
         if not objects:
@@ -430,7 +469,7 @@ def cmd_folder(
         mode = "APPLY" if apply else "DRY-RUN"
         logger.info("Mode: {mode}", mode=mode)
 
-        results = _add_to_content_group(session, cg_id, project_id, objects, apply)
+        results = _add_to_content_group(conn, cg_id, cg_name, objects, apply)
 
         # Write output
         rows = [
