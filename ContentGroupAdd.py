@@ -39,7 +39,6 @@ from pathlib import Path
 from loguru import logger
 from mstrio.project_objects import Dashboard, Document
 from mstrio.project_objects.content_group import ContentGroup, list_content_groups
-from mstrio.object_management import Report
 
 from mstrio_core import (
     MstrConfig,
@@ -59,10 +58,9 @@ _SHORTCUT_TYPE = 18
 _FOLDER_TYPE = 8
 
 # Object types that ContentGroup accepts, mapped to mstrio-py classes.
-# Type 55 = Document/Dashboard, Type 3 = Report
+# Type 55 = Document/Dashboard
 _CONTENT_TYPE_MAP = {
     55: Dashboard,   # Dashboard is the modern form of type 55 (Dossier)
-    3: Report,
 }
 
 _OUTPUT_COLS = [
