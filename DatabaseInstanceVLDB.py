@@ -604,7 +604,7 @@ def _ensure_project_selected(conn) -> None:
     This may be relaxed in a future mstrio-py release.  For now, auto-select
     the first available project so the caller doesn't have to care.
     """
-    if conn.has_project_selected():
+    if getattr(conn, "project_id", None) is not None:
         return
 
     try:
