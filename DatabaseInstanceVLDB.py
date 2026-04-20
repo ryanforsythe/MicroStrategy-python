@@ -441,6 +441,11 @@ def cmd_alter(
             setting=setting_name, value=setting_value, n=len(instances),
         )
 
+        # alter_vldb_settings requires a project selected on the connection,
+        # even for server-level objects.  Auto-select if needed.
+        if apply:
+            _ensure_project_selected(conn)
+
         results: list[dict] = []
 
         for inst in instances:
@@ -588,6 +593,40 @@ def _convert_value(value_str: str, setting):
         return float(value_str)
     else:
         return value_str
+
+
+def _ensure_project_selected(conn) -> None:
+    """
+    Select the first loaded project if none is currently selected.
+
+    The mstrio-py alter_vldb_settings call requires a project to be selected
+    on the Connection, even though database instances are server-level objects.
+    This may be relaxed in a future mstrio-py release.  For now, auto-select
+    the first available project so the caller doesn't have to care.
+    """
+    if conn.has_project_selected():
+        return
+
+    try:
+        from mstrio.server import Environment
+        env = Environment(conn)
+        projects = env.list_projects()
+        if projects:
+            conn.select_project(project_id=projects[0].id)
+            logger.info(
+                "Auto-selected project '{name}' ({id}) — required by "
+                "alter_vldb_settings (server-level workaround).",
+                name=projects[0].name,
+                id=projects[0].id,
+            )
+        else:
+            logger.warning("No projects available to auto-select.")
+    except Exception as exc:
+        logger.warning(
+            "Could not auto-select a project: {exc}. "
+            "alter_vldb_settings may fail.",
+            exc=exc,
+        )
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
