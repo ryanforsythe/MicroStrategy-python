@@ -22,10 +22,11 @@ Output columns:
     login_username     – Default database login username (the DB user)
 
 Usage:
-    python DatabaseInstances.py <env> [--output-dir PATH]
+    python DatabaseInstances.py <env> [--include-all-types] [--output-dir PATH]
 
     python DatabaseInstances.py dev
     python DatabaseInstances.py prod --output-dir c:/reports
+    python DatabaseInstances.py dev --include-all-types
 
 Notes:
     Database instances are server-level objects; no project selection is needed.
@@ -34,6 +35,10 @@ Notes:
     If datasource_login is returned as a bare ID string rather than a full
     object, login_name and login_username will be empty; only login_id is
     populated.
+
+    By default, non-database connector types (cloud connectors, social media,
+    big data engines, etc.) are excluded.  Pass --include-all-types to include
+    every datasource instance regardless of database_type.
 """
 
 import argparse
@@ -49,6 +54,24 @@ from mstrio_core.config import MstrEnvironment
 
 ENVS = [e.value for e in MstrEnvironment]
 OUTPUT_FILENAME = "database_instances.csv"
+
+# database_type values that represent non-database connectors (cloud services,
+# social media, big data engines, etc.).  Excluded by default; pass
+# --include-all-types to include them.
+_EXCLUDED_DATABASE_TYPES: set[str] = {
+    "big_data_engine",
+    "cloud_element",
+    "dropbox",
+    "facebook",
+    "generic_data_connector",
+    "google_analytics",
+    "google_big_query",
+    "google_drive",
+    "salesforce",
+    "spark_config",
+    "twitter",
+    "url_auth",
+}
 COLUMNS = [
     "instance_id",
     "instance_name",
@@ -67,6 +90,39 @@ COLUMNS = [
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _filter_database_types(instances, include_all_types: bool) -> list:
+    """
+    Filter out non-database connector types unless include_all_types is True.
+
+    Returns a (possibly shorter) list of instances.
+    """
+    if include_all_types:
+        return instances
+
+    filtered = []
+    skipped = 0
+    for inst in instances:
+        db_type = str(getattr(inst, "database_type", "") or "").lower()
+        if db_type in _EXCLUDED_DATABASE_TYPES:
+            skipped += 1
+            logger.debug(
+                "Excluding non-database type: {name} ({id}, type={db_type})",
+                name=getattr(inst, "name", "?"),
+                id=getattr(inst, "id", "?"),
+                db_type=db_type,
+            )
+            continue
+        filtered.append(inst)
+
+    if skipped:
+        logger.info(
+            "Excluded {n} non-database connector instance(s). "
+            "Use --include-all-types to include them.",
+            n=skipped,
+        )
+    return filtered
 
 
 def _safe(obj, *attrs, default="") -> str:
@@ -126,14 +182,21 @@ def _instance_row(inst) -> list:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 
-def main(env: str, output_dir: Path | None = None) -> None:
+def main(
+    env: str,
+    include_all_types: bool = False,
+    output_dir: Path | None = None,
+) -> None:
     """
-    Export all database instance definitions from the given environment to CSV.
+    Export database instance definitions from the given environment to CSV.
 
     Args:
-        env:        Environment to connect to ("dev", "qa", or "prod").
-        output_dir: Output directory.  Defaults to MstrConfig.output_dir
-                    (MSTR_OUTPUT_DIR env var, c:/tmp).
+        env:               Environment to connect to ("dev", "qa", or "prod").
+        include_all_types: When False (default), non-database connector types
+                           (cloud connectors, social media, big data engines)
+                           are excluded.  Set True to include everything.
+        output_dir:        Output directory.  Defaults to MstrConfig.output_dir
+                           (MSTR_OUTPUT_DIR env var, c:/tmp).
     """
     config = MstrConfig(environment=MstrEnvironment(env))
     out_path = (output_dir or config.output_dir) / OUTPUT_FILENAME
@@ -147,7 +210,8 @@ def main(env: str, output_dir: Path | None = None) -> None:
             env=env,
         )
         instances = list_datasource_instances(conn)
-        logger.info("Retrieved {n} database instance(s).", n=len(instances))
+        logger.info("Retrieved {n} total database instance(s).", n=len(instances))
+        instances = _filter_database_types(instances, include_all_types)
 
         rows: list[list] = []
         for inst in instances:
@@ -185,9 +249,22 @@ if __name__ == "__main__":
         help="Environment to connect to.",
     )
     parser.add_argument(
+        "--include-all-types",
+        action="store_true",
+        default=False,
+        help=(
+            "Include all datasource types. By default, non-database connectors "
+            "(cloud, social media, big data engines) are excluded."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         metavar="PATH",
         help="Directory for the output CSV (default: MSTR_OUTPUT_DIR or c:/tmp).",
     )
     args = parser.parse_args()
-    main(args.env, Path(args.output_dir) if args.output_dir else None)
+    main(
+        args.env,
+        include_all_types=args.include_all_types,
+        output_dir=Path(args.output_dir) if args.output_dir else None,
+    )

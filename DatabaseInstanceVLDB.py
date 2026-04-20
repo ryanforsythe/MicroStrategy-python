@@ -16,8 +16,8 @@ Subcommands
 Usage
 ─────
   python DatabaseInstanceVLDB.py export <env>
-      [--instance NAME_OR_ID]
-      [--all] [--format csv|json] [--output-dir PATH]
+      [--instance NAME_OR_ID] [--all] [--include-all-types]
+      [--format csv|json] [--output-dir PATH]
 
   python DatabaseInstanceVLDB.py alter <env>
       --setting <name> --value <value>
@@ -66,6 +66,24 @@ from mstrio_core.config import MstrEnvironment
 
 ENVS = [e.value for e in MstrEnvironment]
 
+# database_type values that represent non-database connectors (cloud services,
+# social media, big data engines, etc.).  Excluded by default; pass
+# --include-all-types to include them.
+_EXCLUDED_DATABASE_TYPES: set[str] = {
+    "big_data_engine",
+    "cloud_element",
+    "dropbox",
+    "facebook",
+    "generic_data_connector",
+    "google_analytics",
+    "google_big_query",
+    "google_drive",
+    "salesforce",
+    "spark_config",
+    "twitter",
+    "url_auth",
+}
+
 _EXPORT_CSV_COLS = [
     "instance_id",
     "instance_name",
@@ -103,6 +121,39 @@ def _out_dir(config: MstrConfig, output_dir: Path | None) -> Path:
     d = output_dir or config.output_dir
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _filter_database_types(instances, include_all_types: bool) -> list:
+    """
+    Filter out non-database connector types unless include_all_types is True.
+
+    Returns a (possibly shorter) list of instances.
+    """
+    if include_all_types:
+        return instances
+
+    filtered = []
+    skipped = 0
+    for inst in instances:
+        db_type = str(getattr(inst, "database_type", "") or "").lower()
+        if db_type in _EXCLUDED_DATABASE_TYPES:
+            skipped += 1
+            logger.debug(
+                "Excluding non-database type: {name} ({id}, type={db_type})",
+                name=getattr(inst, "name", "?"),
+                id=getattr(inst, "id", "?"),
+                db_type=db_type,
+            )
+            continue
+        filtered.append(inst)
+
+    if skipped:
+        logger.info(
+            "Excluded {n} non-database connector instance(s). "
+            "Use --include-all-types to include them.",
+            n=skipped,
+        )
+    return filtered
 
 
 def _resolve_instance(conn, name_or_id: str) -> DatasourceInstance:
@@ -238,6 +289,7 @@ def cmd_export(
     env: str,
     instance_name: str | None = None,
     show_all: bool = False,
+    include_all_types: bool = False,
     fmt: str = "csv",
     output_dir: Path | None = None,
 ) -> None:
@@ -245,13 +297,15 @@ def cmd_export(
     Export VLDB settings for database instances.
 
     Args:
-        env:            Environment to connect to.
-        instance_name:  Name or GUID of a specific instance.
-                        None → export all instances.
-        show_all:       True → include settings at default values;
-                        False → non-default only.
-        fmt:            Output format: "csv" or "json".
-        output_dir:     Output directory.
+        env:                Environment to connect to.
+        instance_name:      Name or GUID of a specific instance.
+                            None → export all instances.
+        show_all:           True → include settings at default values;
+                            False → non-default only.
+        include_all_types:  When False, non-database connector types are
+                            excluded from the "all instances" list.
+        fmt:                Output format: "csv" or "json".
+        output_dir:         Output directory.
     """
     config = _make_config(env)
     out = _out_dir(config, output_dir)
@@ -267,6 +321,11 @@ def cmd_export(
             )
         else:
             instances = list_datasource_instances(conn)
+            logger.info(
+                "Retrieved {n} total database instance(s).",
+                n=len(instances),
+            )
+            instances = _filter_database_types(instances, include_all_types)
             logger.info(
                 "Exporting VLDB settings for {n} database instance(s) on {env}",
                 n=len(instances), env=env,
@@ -580,6 +639,15 @@ if __name__ == "__main__":
         default=False,
         help="Include settings at default values (default: non-default only).",
     )
+    p_exp.add_argument(
+        "--include-all-types",
+        action="store_true",
+        default=False,
+        help=(
+            "Include all datasource types. By default, non-database connectors "
+            "(cloud, social media, big data engines) are excluded."
+        ),
+    )
     _add_output_args(p_exp)
 
     # ── alter ────────────────────────────────────────────────────────────
@@ -635,6 +703,7 @@ if __name__ == "__main__":
             env=args.env,
             instance_name=args.instance_name,
             show_all=args.show_all,
+            include_all_types=args.include_all_types,
             fmt=args.fmt,
             output_dir=args.output_dir,
         )
