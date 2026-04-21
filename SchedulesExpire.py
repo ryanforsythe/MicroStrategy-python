@@ -23,7 +23,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from loguru import logger
-from mstrio.distribution_services.schedule import list_schedules
+from mstrio.distribution_services.schedule import Schedule
+from mstrio.object_management.search_operations import full_search
 
 from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
 from mstrio_core.config import MstrEnvironment
@@ -51,6 +52,35 @@ COLUMNS = [
 ]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _list_all_schedules(conn) -> list:
+    """
+    Return all schedules (including hidden) from the Configuration domain.
+
+    Uses full_search with domain=CONFIGURATION (4) and object_types=51
+    (SCHEDULE_TRIGGER) instead of list_schedules(), which only returns
+    non-hidden schedules.
+    """
+    results = full_search(
+        conn, project=None, domain=4, object_types=51, to_dictionary=True,
+    )
+    logger.debug(
+        "full_search returned {n} schedule dict(s) from Configuration domain.",
+        n=len(results),
+    )
+    schedules = []
+    for r in results:
+        try:
+            schedules.append(Schedule(conn, id=r["id"]))
+        except Exception as exc:
+            logger.warning(
+                "Could not instantiate Schedule for {name!r} ({id}): {exc}",
+                name=r.get("name", "?"),
+                id=r.get("id", "?"),
+                exc=exc,
+            )
+    return schedules
 
 
 def _to_date(value) -> date | None:
@@ -172,7 +202,7 @@ def main(
 
     conn = get_mstrio_connection(config=config)
     try:
-        all_schedules = list_schedules(conn)
+        all_schedules = _list_all_schedules(conn)
         logger.info(
             "Retrieved {n} total schedule(s) from {env}.",
             n=len(all_schedules),
