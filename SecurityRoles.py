@@ -52,6 +52,7 @@ Examples
 
 import argparse
 import json as _json
+import re
 from pathlib import Path
 
 from loguru import logger
@@ -96,6 +97,18 @@ _COMPARE_CSV_COLS = [
 ]
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
+
+
+def _safe_filename(name: str) -> str:
+    """
+    Sanitise a role name for use in a file path.
+
+    Replaces spaces with underscores and removes characters that are illegal
+    in Windows filenames (``\\ / : * ? " < > |``).
+    """
+    name = name.replace(" ", "_").replace(".", "_")
+    # Strip characters illegal on Windows
+    return re.sub(r'[\\/:*?"<>|]', "", name)
 
 
 def _make_config(env: str) -> MstrConfig:
@@ -424,7 +437,7 @@ def export_role(
             return
 
         # ── Write output ──────────────────────────────────────────────────
-        safe_name = role.name.replace(" ", "_").replace("/", "-")
+        safe_name = _safe_filename(role.name)
         suffix = "all" if show_all else "enabled"
         out = _out_dir(config, output_dir)
 
@@ -566,8 +579,8 @@ def compare_roles(
     )
 
     # ── Write output ──────────────────────────────────────────────────────
-    src_safe = src_role.name.replace(" ", "_").replace("/", "-")
-    tgt_safe = tgt_role.name.replace(" ", "_").replace("/", "-")
+    src_safe = _safe_filename(src_role.name)
+    tgt_safe = _safe_filename(tgt_role.name)
     suffix = "all" if show_all else "diff"
     out = _out_dir(src_config, output_dir)
 
