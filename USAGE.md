@@ -24,6 +24,7 @@ extraction, and content-group operations.
    - [SecurityRoles.py](#securityrolespy)
    - [SecurityRoleEveryoneRemove.py](#securityroleeveryoneremovepy)
    - [StandardAuthManage.py](#standardauthmanagepy)
+   - [UserGroupMemberManage.py](#usergroupmembermanagepy)
    - [DatabaseInstances.py](#databaseinstancespy)
    - [DatabaseInstanceVLDB.py](#databaseinstancevldbpy)
    - [ReportVLDBCompare.py](#reportvldbcomparepy)
@@ -918,6 +919,117 @@ python StandardAuthManage.py dev --group-id ABCDEF01234567890ABCDEF012345678
 | `standard_auth_after` | `standard_auth` value after (or planned) change |
 | `action` | `disable` / `enable` / `skip` |
 | `status` | `pending` (dry run) / `success` / `skip` / `error: ...` |
+
+---
+
+### UserGroupMemberManage.py
+
+Bulk add or remove users from MicroStrategy user groups.  Accepts user
+logins or GUIDs from the command line or a CSV file, and one or more user
+group targets.
+
+**Safety default — dry run:** The script previews planned changes and writes
+a CSV without modifying the server.  Pass `--apply` to commit.
+
+#### Input modes
+
+| Mode | Description |
+|---|---|
+| `--users LOGIN_OR_ID [...]` | Pass user logins or GUIDs directly on the CLI |
+| `--csv PATH` | Read from a CSV file (see below for accepted column names) |
+
+`--users` and `--csv` are mutually exclusive.
+
+#### User resolution
+
+If the input value is a 32-character hex string, it is treated as a GUID;
+otherwise it is matched by login username (case-insensitive).  All users are
+fetched once via `list_users()` and indexed in memory — no per-user API call
+is needed.
+
+#### Group resolution
+
+Groups are specified by name or GUID via `--group NAME_OR_ID [...]`.
+Required when using `--users`; optional with `--csv` if the CSV contains a
+group column.
+
+#### CSV format
+
+The CSV must contain a user column (any of: `user`, `login`, `username`,
+`user_id`, `id`, `guid`).  An optional group column (`group_id`, `group`,
+`user_group`, `user_group_id`) supplies the target group per row, overriding
+`--group`.  Semicolon, comma, and tab delimiters are auto-detected.
+
+#### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `add` | Add users to the specified group(s) |
+| `remove` | Remove users from the specified group(s) |
+
+#### Usage
+
+```
+python UserGroupMemberManage.py add    <env> --users USER [USER ...] --group GROUP [GROUP ...]
+                                       [--apply] [--concurrency N] [--output-dir PATH]
+
+python UserGroupMemberManage.py remove <env> --users USER [USER ...] --group GROUP [GROUP ...]
+                                       [--apply] [--concurrency N] [--output-dir PATH]
+
+python UserGroupMemberManage.py add    <env> --csv PATH --group GROUP [GROUP ...]
+                                       [--apply] [--concurrency N] [--output-dir PATH]
+
+python UserGroupMemberManage.py add    <env> --csv PATH
+                                       [--apply] [--concurrency N] [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `action` | Yes | Subcommand: `add` or `remove` |
+| `env` | Yes | Environment to process: `dev`, `qa`, or `prod` |
+| `--users` | Yes* | One or more user logins or GUIDs (mutually exclusive with `--csv`) |
+| `--csv` | Yes* | Path to a CSV file with user (and optionally group) columns |
+| `--group` | See below | One or more user group names or GUIDs. Required with `--users`; optional with `--csv` if the CSV has a group column |
+| `--apply` | No | Apply changes to the server (default: dry run — preview only) |
+| `--concurrency N` | No | Thread-pool size for concurrent operations (default: `10`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+\* One of `--users` or `--csv` is required.
+
+#### Examples
+
+```bash
+# Preview — add two users to a group by login
+python UserGroupMemberManage.py add dev --users jsmith agarcia --group "Analysts"
+
+# Apply — add users by GUID to multiple groups
+python UserGroupMemberManage.py add prod --users ABC123DEF456ABC123DEF456ABC123DE \
+    --group "Analysts" "Report Viewers" --apply
+
+# Remove users listed in a CSV
+python UserGroupMemberManage.py remove qa --csv users_to_remove.csv \
+    --group "Old Group" --apply
+
+# Add users from CSV that includes a group_id column (no --group needed)
+python UserGroupMemberManage.py add prod --csv bulk_assignments.csv --apply
+```
+
+#### Output file
+
+`<output-dir>/user_group_member_manage.csv`
+
+**CSV columns:**
+
+| Column | Description |
+|---|---|
+| `user_id` | User GUID (or original input if unresolved) |
+| `user_name` | Login / username |
+| `user_input` | Original input value from CLI or CSV |
+| `group_id` | User group GUID (or original input if unresolved) |
+| `group_name` | User group name |
+| `group_input` | Original group value from CLI or CSV |
+| `action` | `add` / `remove` |
+| `status` | `pending` (dry run) / `success` / `already_member` / `not_member` / `error: ...` / `unresolved_user` / `unresolved_group` |
 
 ---
 
