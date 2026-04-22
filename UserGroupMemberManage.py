@@ -13,6 +13,8 @@ Input modes
                               login, username, user_id, id, guid).  An optional
                               group column (group_id, group, user_group,
                               user_group_id) overrides --group per-row.
+  --excel PATH                Read from an Excel (.xlsx) file.  Same column
+                              name rules as --csv.
 
 Group resolution
 ────────────────
@@ -61,6 +63,9 @@ Usage:
                                       [--apply] [--concurrency N] [--output-dir PATH]
                                       # (group_id column in CSV)
 
+    python UserGroupMemberManage.py add    <env> --excel PATH --group GROUP [GROUP ...]
+                                      [--apply] [--concurrency N] [--output-dir PATH]
+
 Examples:
     # Preview — add two users to a group by login
     python UserGroupMemberManage.py add dev --users jsmith agarcia --group "Analysts"
@@ -76,6 +81,9 @@ Examples:
     # Add users from CSV that includes a group_id column
     python UserGroupMemberManage.py add prod --csv bulk_assignments.csv --apply
 
+    # Read from an Excel file
+    python UserGroupMemberManage.py add prod --excel users.xlsx --group "Analysts" --apply
+
 Run without --apply first to review the CSV output, then re-run with
 --apply to commit the changes.
 """
@@ -89,7 +97,7 @@ from pathlib import Path
 from loguru import logger
 from mstrio.users_and_groups import User, UserGroup, list_users
 
-from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
+from mstrio_core import MstrConfig, get_mstrio_connection, read_excel, write_csv
 from mstrio_core.config import MstrEnvironment
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -211,10 +219,19 @@ def _read_csv_pairs(
     Returns a list of ``(user_value, group_value)`` strings.
     """
     with open(csv_path, newline="", encoding="utf-8-sig") as fh:
-        # Auto-detect delimiter: semicolon (write_csv default) or comma
+        # Auto-detect delimiter: semicolon (write_csv default) or comma.
+        # Excel "Save As CSV" often produces files that csv.Sniffer cannot
+        # parse (single-column or simple comma-only layout), so fall back
+        # to comma — the most common Excel CSV dialect.
         sample = fh.read(4096)
         fh.seek(0)
-        dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=";,\t")
+        except csv.Error:
+            logger.debug(
+                "csv.Sniffer could not detect delimiter — defaulting to comma."
+            )
+            dialect = "excel"  # Python's built-in Excel CSV dialect (comma)
         reader = csv.DictReader(fh, dialect=dialect)
 
         headers = reader.fieldnames or []
@@ -258,6 +275,61 @@ def _read_csv_pairs(
             path=csv_path,
         )
         return pairs
+
+
+def _read_excel_pairs(
+    excel_path: Path,
+    cli_groups: list[str] | None,
+) -> list[tuple[str, str]]:
+    """
+    Read (user_input, group_input) pairs from an Excel (.xlsx) file.
+
+    Column name resolution follows the same aliases as CSV.
+    All cell values are cast to string and stripped.
+    """
+    df = read_excel(excel_path)
+
+    # Normalise column lookup
+    headers = list(df.columns)
+    user_col = _find_csv_column(headers, _USER_COL_ALIASES)
+    group_col = _find_csv_column(headers, _GROUP_COL_ALIASES)
+
+    if not user_col:
+        raise ValueError(
+            f"Excel file must contain a user column (one of: "
+            f"{', '.join(sorted(_USER_COL_ALIASES))}). "
+            f"Found columns: {headers}"
+        )
+
+    if not group_col and not cli_groups:
+        raise ValueError(
+            "No group column found in Excel file and no --group specified.  "
+            "Either add a group column or pass --group."
+        )
+
+    pairs: list[tuple[str, str]] = []
+    for _, row in df.iterrows():
+        user_val = str(row.get(user_col) or "").strip()
+        if not user_val or user_val.lower() == "nan":
+            continue
+
+        if group_col:
+            g_val = str(row.get(group_col) or "").strip()
+            if g_val and g_val.lower() != "nan":
+                pairs.append((user_val, g_val))
+            elif cli_groups:
+                for g in cli_groups:
+                    pairs.append((user_val, g))
+        else:
+            for g in cli_groups:  # type: ignore[union-attr]
+                pairs.append((user_val, g))
+
+    logger.info(
+        "Read {n} (user, group) pair(s) from {path}.",
+        n=len(pairs),
+        path=excel_path,
+    )
+    return pairs
 
 
 # ── Concurrent membership operations ────────────────────────────────────────
@@ -382,6 +454,7 @@ def main(
     env: str,
     users_cli: list[str] | None = None,
     csv_path: Path | None = None,
+    excel_path: Path | None = None,
     groups_cli: list[str] | None = None,
     dry_run: bool = True,
     concurrency: int = DEFAULT_CONCURRENCY,
@@ -394,8 +467,9 @@ def main(
         action:      ``"add"`` or ``"remove"``.
         env:         Environment to connect to (``"dev"``, ``"qa"``, ``"prod"``).
         users_cli:   User logins or GUIDs from the CLI (mutually exclusive
-                     with *csv_path*).
+                     with *csv_path* and *excel_path*).
         csv_path:    Path to a CSV file with user (and optionally group) columns.
+        excel_path:  Path to an Excel (.xlsx) file (same column rules as CSV).
         groups_cli:  User group names or GUIDs from the CLI.
         dry_run:     When True (default), write preview CSV only.
         concurrency: Thread-pool size.
@@ -410,6 +484,8 @@ def main(
         # ── 1. Build (user_input, group_input) pairs ────────────────────────
         if csv_path:
             pairs = _read_csv_pairs(csv_path, groups_cli)
+        elif excel_path:
+            pairs = _read_excel_pairs(excel_path, groups_cli)
         else:
             if not groups_cli:
                 raise ValueError("--group is required when using --users.")
@@ -584,7 +660,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
             "Bulk add or remove users from MicroStrategy user groups.  "
-            "Accepts user logins or GUIDs from the CLI or a CSV file."
+            "Accepts user logins or GUIDs from the CLI, a CSV file, "
+            "or an Excel (.xlsx) file."
         ),
     )
     subparsers = parser.add_subparsers(dest="action", required=True)
@@ -619,7 +696,18 @@ if __name__ == "__main__":
                 "Path to a CSV file with a user column "
                 "(user, login, username, user_id, id, or guid).  "
                 "An optional group column (group_id, group, user_group, "
-                "user_group_id) overrides --group per-row."
+                "user_group_id) overrides --group per-row.  "
+                "Works with Excel 'Save As CSV' files."
+            ),
+        )
+        input_group.add_argument(
+            "--excel",
+            type=Path,
+            metavar="PATH",
+            help=(
+                "Path to an Excel (.xlsx) file.  Same column name rules "
+                "as --csv.  Use this when a CSV saved from Excel causes "
+                "delimiter detection issues."
             ),
         )
 
@@ -629,8 +717,8 @@ if __name__ == "__main__":
             metavar="NAME_OR_ID",
             help=(
                 "One or more user group names or GUIDs.  "
-                "Required when using --users; optional with --csv if "
-                "the CSV has a group column."
+                "Required when using --users; optional with --csv/--excel "
+                "if the file has a group column."
             ),
         )
         sp.add_argument(
@@ -668,6 +756,7 @@ if __name__ == "__main__":
         env=args.env,
         users_cli=getattr(args, "users", None),
         csv_path=getattr(args, "csv", None),
+        excel_path=getattr(args, "excel", None),
         groups_cli=getattr(args, "group", None),
         dry_run=args.dry_run,
         concurrency=args.concurrency,

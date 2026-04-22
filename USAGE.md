@@ -925,8 +925,8 @@ python StandardAuthManage.py dev --group-id ABCDEF01234567890ABCDEF012345678
 ### UserGroupMemberManage.py
 
 Bulk add or remove users from MicroStrategy user groups.  Accepts user
-logins or GUIDs from the command line or a CSV file, and one or more user
-group targets.
+logins or GUIDs from the command line, a CSV file, or an Excel (.xlsx) file,
+and one or more user group targets.
 
 **Safety default — dry run:** The script previews planned changes and writes
 a CSV without modifying the server.  Pass `--apply` to commit.
@@ -936,9 +936,10 @@ a CSV without modifying the server.  Pass `--apply` to commit.
 | Mode | Description |
 |---|---|
 | `--users LOGIN_OR_ID [...]` | Pass user logins or GUIDs directly on the CLI |
-| `--csv PATH` | Read from a CSV file (see below for accepted column names) |
+| `--csv PATH` | Read from a CSV file (see below for accepted column names). Works with Excel "Save As CSV" files |
+| `--excel PATH` | Read from an Excel (.xlsx) file. Same column name rules as `--csv`. Use when CSV saved from Excel causes delimiter issues |
 
-`--users` and `--csv` are mutually exclusive.
+`--users`, `--csv`, and `--excel` are mutually exclusive.
 
 #### User resolution
 
@@ -950,15 +951,17 @@ is needed.
 #### Group resolution
 
 Groups are specified by name or GUID via `--group NAME_OR_ID [...]`.
-Required when using `--users`; optional with `--csv` if the CSV contains a
-group column.
+Required when using `--users`; optional with `--csv`/`--excel` if the file
+contains a group column.
 
-#### CSV format
+#### CSV / Excel column format
 
-The CSV must contain a user column (any of: `user`, `login`, `username`,
+The file must contain a user column (any of: `user`, `login`, `username`,
 `user_id`, `id`, `guid`).  An optional group column (`group_id`, `group`,
 `user_group`, `user_group_id`) supplies the target group per row, overriding
-`--group`.  Semicolon, comma, and tab delimiters are auto-detected.
+`--group`.  For CSV files, semicolon, comma, and tab delimiters are
+auto-detected (falls back to comma for Excel "Save As CSV" files that the
+sniffer cannot parse).
 
 #### Subcommands
 
@@ -981,20 +984,24 @@ python UserGroupMemberManage.py add    <env> --csv PATH --group GROUP [GROUP ...
 
 python UserGroupMemberManage.py add    <env> --csv PATH
                                        [--apply] [--concurrency N] [--output-dir PATH]
+
+python UserGroupMemberManage.py add    <env> --excel PATH --group GROUP [GROUP ...]
+                                       [--apply] [--concurrency N] [--output-dir PATH]
 ```
 
 | Argument | Required | Description |
 |---|---|---|
 | `action` | Yes | Subcommand: `add` or `remove` |
 | `env` | Yes | Environment to process: `dev`, `qa`, or `prod` |
-| `--users` | Yes* | One or more user logins or GUIDs (mutually exclusive with `--csv`) |
+| `--users` | Yes* | One or more user logins or GUIDs (mutually exclusive with `--csv` / `--excel`) |
 | `--csv` | Yes* | Path to a CSV file with user (and optionally group) columns |
-| `--group` | See below | One or more user group names or GUIDs. Required with `--users`; optional with `--csv` if the CSV has a group column |
+| `--excel` | Yes* | Path to an Excel (.xlsx) file (same column rules as `--csv`) |
+| `--group` | See below | One or more user group names or GUIDs. Required with `--users`; optional with `--csv`/`--excel` if the file has a group column |
 | `--apply` | No | Apply changes to the server (default: dry run — preview only) |
 | `--concurrency N` | No | Thread-pool size for concurrent operations (default: `10`) |
 | `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
 
-\* One of `--users` or `--csv` is required.
+\* One of `--users`, `--csv`, or `--excel` is required.
 
 #### Examples
 
@@ -1012,6 +1019,9 @@ python UserGroupMemberManage.py remove qa --csv users_to_remove.csv \
 
 # Add users from CSV that includes a group_id column (no --group needed)
 python UserGroupMemberManage.py add prod --csv bulk_assignments.csv --apply
+
+# Read from an Excel file
+python UserGroupMemberManage.py add prod --excel users.xlsx --group "Analysts" --apply
 ```
 
 #### Output file
