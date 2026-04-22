@@ -21,6 +21,16 @@ extraction, and content-group operations.
    - [SchedulesActivate.py](#schedulesactivatepy)
    - [ServerSettingsCompare.py](#serversettingscomparepy)
    - [UserGroups.py](#usergroupspy)
+   - [SecurityRoles.py](#securityrolespy)
+   - [SecurityRoleEveryoneRemove.py](#securityroleeveryoneremovepy)
+   - [StandardAuthManage.py](#standardauthmanagepy)
+   - [DatabaseInstances.py](#databaseinstancespy)
+   - [DatabaseInstanceVLDB.py](#databaseinstancevldbpy)
+   - [ReportVLDBCompare.py](#reportvldbcomparepy)
+   - [ContentGroupAdd.py](#contentgroupaddpy)
+   - [LogicalTables.py](#logicaltablespy)
+   - [ProjectSecurityCompare.py](#projectsecuritycomparepy)
+   - [ProjectDuplicate.py](#projectduplicatepy)
 5. [Legacy Scripts](#legacy-scripts)
 6. [Output Files](#output-files)
 7. [Logging](#logging)
@@ -106,8 +116,7 @@ MSTR_{ENV}_{SETTING}  →  MSTR_{SETTING}  →  built-in default
 For example, when `MSTR_ENV=qa`, `MSTR_QA_BASE_URL` is used before
 `MSTR_BASE_URL`.
 
-The CLI scripts (`UsersExport.py`, `SchedulesExpire.py`, `SchedulesActivate.py`,
-`ServerSettingsCompare.py`) override `MSTR_ENV` at runtime by constructing
+All CLI scripts override `MSTR_ENV` at runtime by constructing
 `MstrConfig(environment=MstrEnvironment(env))` from the environment argument
 you pass on the command line — so the `.env`-level `MSTR_ENV` does not need
 to match for those scripts.
@@ -638,6 +647,568 @@ containing only user objects (`type` is always `"user"`).
 | `group_name` | Group display name |
 | `user_id` | User GUID |
 | `user_name` | User display name |
+
+---
+
+### SecurityRoles.py
+
+Export and compare MicroStrategy security role privileges.
+
+#### Subcommands
+
+```
+python SecurityRoles.py list-all <env>            [--all] [--format csv|json] [--output-dir PATH]
+python SecurityRoles.py export   <env> <role>     [--all] [--format csv|json] [--output-dir PATH]
+python SecurityRoles.py compare  <env> <role> <env2> <role2>
+                                                  [--all] [--format csv|json] [--output-dir PATH]
+```
+
+---
+
+#### `list-all` — export privileges for every role
+
+Lists the privileges granted to every security role on the environment.
+By default shows only **enabled** privileges; pass `--all` to include every
+privilege with an enabled/disabled indicator.
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--all` | No | Show every privilege with enabled/disabled status (default: enabled only) |
+| `--format csv\|json` | No | Output format (default: `csv`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+# Enabled privileges for all roles on dev
+python SecurityRoles.py list-all dev
+
+# ALL privileges (enabled + disabled) for all roles on qa, JSON output
+python SecurityRoles.py list-all qa --all --format json
+```
+
+**Output file:** `<output-dir>/security_roles_<env>_enabled.csv` (or `_all`)
+
+**CSV columns:** `role_id`, `role_name`, `priv_id`, `priv_name`,
+`priv_description`, `priv_category`, `is_project_level`, `enabled`
+
+---
+
+#### `export` — privileges for a single role
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `role` | Yes | Security role name (use quotes for names with spaces) |
+| `--all` | No | Show every privilege with enabled/disabled status (default: enabled only) |
+| `--format csv\|json` | No | Output format (default: `csv`) |
+| `--output-dir PATH` | No | Output directory |
+
+```bash
+python SecurityRoles.py export dev "Normal Users"
+python SecurityRoles.py export dev "Normal Users" --all
+```
+
+**Output file:** `<output-dir>/security_role_<role_name>_<env>_enabled.csv` (or `_all`)
+
+---
+
+#### `compare` — diff privileges between two roles
+
+Compares privileges between two roles (same or different environments).
+By default shows only **differences**; pass `--all` to include matching
+privileges too.
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Source environment |
+| `role` | Yes | Source security role name |
+| `env2` | Yes | Target environment |
+| `role2` | Yes | Target security role name |
+| `--all` | No | Show all privileges with match status (default: differences only) |
+| `--format csv\|json` | No | Output format (default: `csv`) |
+| `--output-dir PATH` | No | Output directory |
+
+```bash
+# Compare same role across environments — show only differences
+python SecurityRoles.py compare dev "Normal Users" qa "Normal Users"
+
+# Compare two different roles on prod — full view
+python SecurityRoles.py compare prod "Normal Users" prod "Power Users" --all
+```
+
+**Output file:** `<output-dir>/security_role_compare_<src>_<src_env>_vs_<tgt>_<tgt_env>_diff.csv` (or `_all`)
+
+**CSV columns:** `priv_id`, `priv_name`, `priv_category`, `is_project_level`,
+`source_role_id`, `source_role_name`, `source_env`, `source_enabled`,
+`target_role_id`, `target_role_name`, `target_env`, `target_enabled`, `match`
+
+---
+
+### SecurityRoleEveryoneRemove.py
+
+Remove a user group (default: "Everyone") from all security role assignments
+across every loaded project on the server.
+
+Scans each loaded project and each security role, checking whether the target
+group is assigned.  When found, the assignment is revoked.
+
+**Safety default — dry run:** The script previews findings and writes a CSV
+without modifying the server.  Pass `--apply` to commit the revocations.
+
+#### Usage
+
+```
+python SecurityRoleEveryoneRemove.py <env> [--apply] [--group NAME] [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to process: `dev`, `qa`, or `prod` |
+| `--apply` | No | Apply changes to the server (default: dry run — preview only) |
+| `--group NAME` | No | User group name to remove (default: `"Everyone"`). Use quotes if the name contains spaces |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+#### Examples
+
+```bash
+# Preview — see which projects have "Everyone" in a security role
+python SecurityRoleEveryoneRemove.py dev
+
+# Apply — revoke "Everyone" from all security roles on all projects
+python SecurityRoleEveryoneRemove.py prod --apply
+
+# Target a different group
+python SecurityRoleEveryoneRemove.py dev --group "Public / Guest"
+```
+
+#### Output file
+
+`<output-dir>/everyone_role_removal.csv`
+
+**CSV columns:**
+
+| Column | Description |
+|---|---|
+| `project_name` | Project name |
+| `project_id` | Project GUID |
+| `role_name` | Security role name |
+| `role_id` | Security role GUID |
+| `group_name` | User group name |
+| `group_id` | User group GUID |
+| `action` | `revoke` (planned or executed) |
+| `status` | `pending` (dry run) / `success` / `error: ...` |
+
+---
+
+### StandardAuthManage.py
+
+Manage standard authentication based on user group membership.  Disables
+`standard_auth` for users who do **not** belong to the specified user group
+(default: "Function Access: Standard Authentication").
+
+Group membership is resolved via the REST API `flatMembers` endpoint, which
+expands nested groups recursively.
+
+#### Script-specific configuration
+
+The excepted user group GUID is stored in a script-specific env file
+(`StandardAuthManage.env` in the script directory) and can be overridden at
+runtime:
+
+```ini
+# StandardAuthManage.env  (copy from StandardAuthManage.env.example)
+STANDARD_AUTH_GROUP_ID=ABCDEF01234567890ABCDEF012345678
+CONCURRENCY=10
+```
+
+#### Concurrency
+
+`list_users()` returns lightweight user objects without the `standard_auth`
+attribute.  Each user must be fetched individually via `User(conn, id=...)`
+to read (and write) that flag.  To keep run times reasonable on large
+environments, both the fetch and apply phases use a thread pool.
+
+The thread count is set via `CONCURRENCY` in `StandardAuthManage.env`
+(default: 10) and can be overridden at runtime with `--concurrency`.
+
+#### Last-run tracking
+
+When `--apply` is used, the script records the execution timestamp in the
+same `StandardAuthManage.env` file as a per-environment variable
+(`LAST_RUN_DEV`, `LAST_RUN_QA`, `LAST_RUN_PROD`).  On subsequent runs, pass
+`--since-last-run` to process only users whose `date_modified` is after the
+recorded timestamp.
+
+The **default is to scan all users** (no date filter).  This is intentional:
+users migrated from another environment may retain their original
+`date_modified` from the source server, which could predate the last run on
+the target and cause them to be incorrectly skipped.  Use `--since-last-run`
+only after a full initial review has been completed.
+
+#### Standard auth logic
+
+| `standard_auth` value | Meaning |
+|---|---|
+| `True` | Standard authentication explicitly allowed |
+| `False` | Standard authentication explicitly disabled |
+| `None` | Not set (inherits server default — may allow standard auth) |
+
+For users **not** in the excepted group: `True` or `None` → disabled.
+For users **in** the excepted group with `--enable-excepted`: `False` or `None` → enabled.
+
+#### Usage
+
+```
+python StandardAuthManage.py <env>  [--apply]
+                                    [--group-id GUID]
+                                    [--enabled-only]
+                                    [--enable-excepted]
+                                    [--since-last-run]
+                                    [--concurrency N]
+                                    [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment to process: `dev`, `qa`, or `prod` |
+| `--apply` | No | Apply changes to the server (default: dry run — preview only) |
+| `--group-id GUID` | No | Override the excepted group GUID from `StandardAuthManage.env` |
+| `--enabled-only` | No | Only scan enabled user accounts (default: all users) |
+| `--enable-excepted` | No | Also enable `standard_auth` for users in the excepted group (default: excepted users are only used as a skip list) |
+| `--since-last-run` | No | Only process users modified since the last `--apply` run (default: all users) |
+| `--concurrency N` | No | Thread-pool size for fetch and apply phases (default: `CONCURRENCY` in `.env` or `10`) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+#### Examples
+
+```bash
+# Preview — no changes (scans all users)
+python StandardAuthManage.py dev
+
+# Apply changes on prod
+python StandardAuthManage.py prod --apply
+
+# Only scan enabled user accounts
+python StandardAuthManage.py dev --enabled-only
+
+# Also enable standard_auth for users IN the excepted group
+python StandardAuthManage.py dev --apply --enable-excepted
+
+# Only process users modified since the last --apply run
+python StandardAuthManage.py dev --apply --since-last-run
+
+# Override group ID at runtime
+python StandardAuthManage.py dev --group-id ABCDEF01234567890ABCDEF012345678
+```
+
+#### Output file
+
+`<output-dir>/standard_auth_manage.csv`
+
+**CSV columns:**
+
+| Column | Description |
+|---|---|
+| `user_id` | User GUID |
+| `user_name` | Login / username |
+| `full_name` | Display name |
+| `enabled` | Whether the user account is enabled |
+| `in_excepted_group` | Whether the user is in the excepted group (flat/recursive) |
+| `standard_auth_before` | `standard_auth` value before this run |
+| `standard_auth_after` | `standard_auth` value after (or planned) change |
+| `action` | `disable` / `enable` / `skip` |
+| `status` | `pending` (dry run) / `success` / `skip` / `error: ...` |
+
+---
+
+### DatabaseInstances.py
+
+Export MicroStrategy database instance definitions to CSV.
+
+Retrieves each database instance from the Intelligence Server, along with the
+underlying datasource connection (ODBC data source / connection string) and
+the default database login.  Database instances are server-level objects — no
+project selection is needed.
+
+#### Usage
+
+```
+python DatabaseInstances.py <env> [--include-all-types] [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--include-all-types` | No | Include all datasource types (default: excludes cloud connectors, social media, big data engines) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+```bash
+python DatabaseInstances.py dev
+python DatabaseInstances.py prod --output-dir c:/reports
+python DatabaseInstances.py dev --include-all-types
+```
+
+**Output file:** `<output-dir>/database_instances.csv`
+
+**CSV columns:** `instance_id`, `instance_name`, `description`, `dbms_id`,
+`dbms_name`, `database_type`, `database_version`, `datasource_type`,
+`connection_id`, `connection_name`, `connection_string`, `login_id`,
+`login_name`, `login_username`
+
+---
+
+### DatabaseInstanceVLDB.py
+
+Export and modify VLDB settings on database instances.
+
+#### Subcommands
+
+```
+python DatabaseInstanceVLDB.py export <env> [--instance NAME_OR_ID] [--all]
+                                            [--format csv|json] [--output-dir PATH]
+python DatabaseInstanceVLDB.py alter  <env> --instance NAME_OR_ID --setting NAME --value VAL
+                                            [--apply] [--format csv|json] [--output-dir PATH]
+python DatabaseInstanceVLDB.py alter  <env> --csv PATH --setting NAME --value VAL
+                                            [--apply] [--format csv|json] [--output-dir PATH]
+```
+
+---
+
+#### `export` — document VLDB settings
+
+Exports VLDB settings for a single instance (`--instance`) or all database
+instances.  By default only non-default settings are shown; pass `--all` to
+include every setting.
+
+```bash
+# Non-default settings for all instances
+python DatabaseInstanceVLDB.py export dev
+
+# All settings for a specific instance
+python DatabaseInstanceVLDB.py export dev --instance "My Warehouse" --all
+```
+
+---
+
+#### `alter` — change a VLDB setting
+
+Changes a VLDB setting on one or more database instances.  Dry-run by default;
+pass `--apply` to execute.
+
+```bash
+# Preview changing a setting on a single instance
+python DatabaseInstanceVLDB.py alter dev --instance "My Warehouse" --setting "Metric Join Type" --value 1
+
+# Apply via CSV (file must have an instance_id column)
+python DatabaseInstanceVLDB.py alter dev --csv instances.csv --setting "Metric Join Type" --value 1 --apply
+```
+
+---
+
+### ReportVLDBCompare.py
+
+Compare VLDB settings between two reports (same or different environments).
+
+#### Subcommands
+
+```
+python ReportVLDBCompare.py compare <src_env> <src_id> <tgt_env> <tgt_id>
+                                    [--all] [--src-project NAME] [--tgt-project NAME]
+                                    [--format csv|json] [--output-dir PATH]
+python ReportVLDBCompare.py export  <env> <report_id>
+                                    [--format csv|json] [--output-dir PATH]
+```
+
+---
+
+#### `compare` — diff VLDB settings between two reports
+
+Shows only differences by default; pass `--all` for the full view with match
+status.  Supports cross-environment comparison with `--src-project` /
+`--tgt-project` overrides.
+
+```bash
+python ReportVLDBCompare.py compare dev REPORT1_ID qa REPORT2_ID
+python ReportVLDBCompare.py compare dev REPORT1_ID dev REPORT2_ID --all
+```
+
+---
+
+#### `export` — dump VLDB settings for a single report
+
+```bash
+python ReportVLDBCompare.py export dev REPORT_ID
+```
+
+---
+
+### ContentGroupAdd.py
+
+Add objects to a MicroStrategy content group.
+
+#### Subcommands
+
+```
+python ContentGroupAdd.py csv    <env> --content-group <name-or-id> --csv <path>
+                                 [--project NAME] [--apply] [--output-dir PATH]
+python ContentGroupAdd.py folder <env> --content-group <name-or-id> --folder <guid>
+                                 [--project NAME] [--apply] [--output-dir PATH]
+```
+
+---
+
+#### `csv` — add objects from a CSV file
+
+Reads GUIDs from a CSV file with a `GUID` column (additional columns are
+ignored).  Resolves each GUID for name and type before adding.
+
+```bash
+python ContentGroupAdd.py csv dev --content-group "My Content Group" --csv guids.csv
+python ContentGroupAdd.py csv prod --content-group "My Content Group" --csv guids.csv --apply
+```
+
+---
+
+#### `folder` — add objects from a folder
+
+Reads all non-hidden, non-folder contents from a folder GUID.  Shortcuts are
+resolved to their target objects.
+
+```bash
+python ContentGroupAdd.py folder qa --content-group ABC123 --folder DEF456 --apply
+```
+
+Dry-run by default; `--apply` to execute.  Content group can be specified by
+name or GUID.
+
+---
+
+### LogicalTables.py
+
+Export and compare logical table definitions.
+
+#### Subcommands
+
+```
+python LogicalTables.py export  <env> [--project NAME] [--format csv|json|excel]
+                                      [--output-dir PATH]
+python LogicalTables.py compare <src_env> <tgt_env> [--src-project NAME] [--tgt-project NAME]
+                                [--all] [--format csv|json] [--output-dir PATH]
+```
+
+---
+
+#### `export` — document all logical tables
+
+Exports table metadata, physical table mapping, logical size, and mapped
+attributes/facts with key indicators.
+
+```bash
+python LogicalTables.py export dev
+python LogicalTables.py export prod --format excel
+```
+
+**Output files (CSV):** `*_tables.csv` + `*_objects.csv`
+**Output files (Excel):** multi-sheet workbook
+**Output files (JSON):** nested JSON
+
+---
+
+#### `compare` — diff tables between two projects
+
+Checks `is_logical_size_locked`, `logical_size` at table level and object
+membership + `is_key` at attribute level.  Differences only by default;
+`--all` for full view.
+
+```bash
+python LogicalTables.py compare dev qa
+python LogicalTables.py compare dev prod --all
+```
+
+---
+
+### ProjectSecurityCompare.py
+
+Compare project-level security between two projects (same or different
+environments).
+
+#### Subcommands
+
+```
+python ProjectSecurityCompare.py roles   <src_env> <src_project> <tgt_env> <tgt_project>
+                                         [--format csv|json] [--output-dir PATH]
+python ProjectSecurityCompare.py filters <src_env> <src_project> <tgt_env> <tgt_project>
+                                         [--format csv|json] [--output-dir PATH]
+python ProjectSecurityCompare.py apply-roles   <tgt_env> <tgt_project> --csv <diff.csv>
+                                               [--apply] [--output-dir PATH]
+python ProjectSecurityCompare.py apply-filters <tgt_env> <tgt_project> --csv <diff.csv>
+                                               [--apply] [--output-dir PATH]
+```
+
+---
+
+#### `roles` — diff security role assignments
+
+Shows members in source only, target only, or with different roles.
+
+```bash
+python ProjectSecurityCompare.py roles dev "Project A" qa "Project A"
+```
+
+---
+
+#### `filters` — diff security filter assignments
+
+Shows filter+member pairs in source only or target only.
+
+```bash
+python ProjectSecurityCompare.py filters dev "Project A" qa "Project A"
+```
+
+---
+
+#### `apply-roles` / `apply-filters` — apply a diff CSV
+
+Reads a diff CSV (from the `roles` or `filters` subcommand) and grants/revokes
+assignments on the target.  CSV includes a `target_action` column
+(`Apply`/`Remove`) for review before applying.  Dry-run by default; `--apply`
+to execute.
+
+```bash
+python ProjectSecurityCompare.py apply-roles qa "Project A" --csv roles_diff.csv --apply
+```
+
+---
+
+### ProjectDuplicate.py
+
+Duplicate a MicroStrategy project within or across environments.
+
+Reads parameters from a YAML config file (`project_duplicate_config.yaml`).
+Supports same-environment and cross-environment (two-phase export→import)
+duplication with async status polling.
+
+#### Usage
+
+```
+python ProjectDuplicate.py <env> [--apply] [--config PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--apply` | No | Execute the duplication (default: dry run — preview only) |
+| `--config PATH` | No | Path to YAML config file (default: `project_duplicate_config.yaml`) |
+
+```bash
+# Preview what would be duplicated
+python ProjectDuplicate.py dev
+
+# Execute the duplication
+python ProjectDuplicate.py dev --apply
+```
+
+Dry-run by default; `--apply` to execute.
 
 ---
 
