@@ -150,8 +150,11 @@ def _build_user_lookup(conn) -> tuple[dict, dict]:
     username_map: dict[str, User] = {}
     for u in all_users:
         id_map[u.id.upper()] = u
-        # u.name is the login/username in mstrio-py
-        if u.name:
+        # u.username is the login; u.name is the display name.
+        # Index both so callers can match by either value.
+        if u.username:
+            username_map[u.username.lower()] = u
+        if u.name and u.name.lower() not in username_map:
             username_map[u.name.lower()] = u
 
     return id_map, username_map
