@@ -22,6 +22,7 @@ extraction, and content-group operations.
    - [ServerSettingsCompare.py](#serversettingscomparepy)
    - [UserGroups.py](#usergroupspy)
    - [SecurityRoles.py](#securityrolespy)
+   - [SecurityRoleMembers.py](#securityrolememberspy)
    - [SecurityRoleEveryoneRemove.py](#securityroleeveryoneremovepy)
    - [StandardAuthManage.py](#standardauthmanagepy)
    - [UserGroupMemberManage.py](#usergroupmembermanagepy)
@@ -742,6 +743,146 @@ python SecurityRoles.py compare prod "Normal Users" prod "Power Users" --all
 **CSV columns:** `priv_id`, `priv_name`, `priv_category`, `is_project_level`,
 `source_role_id`, `source_role_name`, `source_env`, `source_enabled`,
 `target_role_id`, `target_role_name`, `target_env`, `target_enabled`, `match`
+
+---
+
+### SecurityRoleMembers.py
+
+Export and manage security role member assignments across MicroStrategy
+projects.  Outputs one row per (role, project, member) triple and supports
+adding/removing members from roles via file input.
+
+**Safety default — dry run:** Modifying subcommands preview changes and write
+a CSV without touching the server.  Pass `--apply` to commit.
+
+#### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `export` | List all security role member assignments.  Optionally filter by `--role-id` and/or `--project-id` |
+| `remove-all` | Revoke every member from the specified role(s) on the specified project(s).  With no filters, removes ALL members from ALL roles on ALL loaded projects |
+| `add` | Grant security role assignments from a CSV or Excel file |
+| `remove` | Revoke security role assignments from a CSV or Excel file |
+
+#### Member type handling
+
+The input file identifies members via one of three column strategies
+(checked per-row in priority order):
+
+| Priority | Column(s) | Aliases | Behaviour |
+|---|---|---|---|
+| 1 | `user_id` | `userid` | Value is always resolved as a **User** |
+| 2 | `user_group_id` | `usergroupid`, `user_groupid` | Value is always resolved as a **UserGroup** |
+| 3 | `member_id` + `is_group` | `memberid`, `id` + `isgroup`, `is_user_group`, `member_type` | Generic — `is_group` (`True`/`False`/`1`/`0`/`yes`/`no`/`UserGroup`) determines the type |
+
+A file may contain columns for more than one strategy.  Each row uses
+whichever column has a non-empty value (user_id is checked first, then
+user_group_id, then member_id).  This means the export output (which uses
+`member_id` + `is_group`) can be fed back to `add`/`remove` without
+modification, but you can also create simpler files with just `user_id` or
+`user_group_id` columns.
+
+#### Input file format (add / remove)
+
+Always-required columns:
+
+| Column | Aliases | Description |
+|---|---|---|
+| `role_id` | `security_role_id`, `securityroleid` | Security role GUID |
+| `project_id` | `projectid` | Project GUID |
+
+Plus at least one member identifier (see Member type handling above).
+
+CSV delimiter is auto-detected (semicolon, comma, tab) with comma fallback
+for Excel "Save As CSV" files.  Excel (.xlsx) is also supported via `--excel`.
+
+#### Usage
+
+```
+python SecurityRoleMembers.py export     <env> [--role-id ID ...] [--project-id ID ...]
+                                         [--format csv|json] [--output-dir PATH]
+
+python SecurityRoleMembers.py remove-all <env> [--role-id ID ...] [--project-id ID ...]
+                                         [--apply] [--output-dir PATH]
+
+python SecurityRoleMembers.py add        <env> --csv PATH   [--apply] [--output-dir PATH]
+python SecurityRoleMembers.py add        <env> --excel PATH [--apply] [--output-dir PATH]
+
+python SecurityRoleMembers.py remove     <env> --csv PATH   [--apply] [--output-dir PATH]
+python SecurityRoleMembers.py remove     <env> --excel PATH [--apply] [--output-dir PATH]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `command` | Yes | Subcommand: `export`, `remove-all`, `add`, or `remove` |
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--role-id ID [...]` | No | Filter to specific security role GUIDs (default: all roles). For `export` and `remove-all` |
+| `--project-id ID [...]` | No | Filter to specific project GUIDs (default: all loaded). For `export` and `remove-all` |
+| `--csv PATH` | Yes* | CSV file with role assignments. For `add` and `remove` |
+| `--excel PATH` | Yes* | Excel file with role assignments. For `add` and `remove` |
+| `--format csv\|json` | No | Output format for `export` (default: csv) |
+| `--apply` | No | Apply changes (default: dry run — preview only) |
+| `--output-dir PATH` | No | Output directory (default: `MSTR_OUTPUT_DIR` or `c:/tmp`) |
+
+\* One of `--csv` or `--excel` is required for `add` and `remove`.
+
+#### Examples
+
+```bash
+# Export all role assignments across all projects
+python SecurityRoleMembers.py export dev
+
+# Export for specific roles and projects
+python SecurityRoleMembers.py export prod --role-id ABC123 DEF456 --project-id 789012
+
+# Export to JSON
+python SecurityRoleMembers.py export dev --format json
+
+# Preview removing ALL members from a single role on all projects
+python SecurityRoleMembers.py remove-all prod --role-id ABC123
+
+# Apply — remove all members from a role on specific projects
+python SecurityRoleMembers.py remove-all prod --role-id ABC123 --project-id 789012 --apply
+
+# Add members from a CSV (exported, filtered, then fed back)
+python SecurityRoleMembers.py add prod --csv assignments.csv --apply
+
+# Remove members listed in an Excel file
+python SecurityRoleMembers.py remove qa --excel removals.xlsx --apply
+```
+
+#### Workflow: export → filter → apply
+
+A common pattern is to export all assignments, filter the output CSV/Excel to
+the desired subset, then feed it back as input:
+
+```bash
+# 1. Export everything
+python SecurityRoleMembers.py export prod
+
+# 2. Open security_role_members.csv, filter/edit as needed, save
+
+# 3. Remove those specific assignments
+python SecurityRoleMembers.py remove prod --csv c:/tmp/security_role_members.csv --apply
+```
+
+#### Output file
+
+`<output-dir>/security_role_members.csv` (or `.json` for export)
+
+**CSV columns:**
+
+| Column | Description |
+|---|---|
+| `role_id` | Security role GUID |
+| `role_name` | Security role name |
+| `project_id` | Project GUID |
+| `project_name` | Project name |
+| `member_id` | User or UserGroup GUID |
+| `member_name` | Display name |
+| `is_group` | `True` if UserGroup, `False` if User |
+| `action` | `export` / `add` / `remove` / `remove-all` |
+| `status` | `ok` (export) / `pending` (dry run) / `success` / `error: ...` |
 
 ---
 
