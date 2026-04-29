@@ -26,6 +26,8 @@ extraction, and content-group operations.
    - [SecurityRoleEveryoneRemove.py](#securityroleeveryoneremovepy)
    - [StandardAuthManage.py](#standardauthmanagepy)
    - [UserGroupMemberManage.py](#usergroupmembermanagepy)
+   - [SystemManager_ClearCache.py](#systemmanager_clearcachepy)
+   - [ExecuteObjects.py](#executeobjectspy)
    - [DatabaseInstances.py](#databaseinstancespy)
    - [DatabaseInstanceVLDB.py](#databaseinstancevldbpy)
    - [ReportVLDBCompare.py](#reportvldbcomparepy)
@@ -1181,6 +1183,270 @@ python UserGroupMemberManage.py add prod --excel users.xlsx --group "Analysts" -
 | `group_input` | Original group value from CLI or CSV |
 | `action` | `add` / `remove` |
 | `status` | `pending` (dry run) / `success` / `already_member` / `not_member` / `error: ...` / `unresolved_user` / `unresolved_group` |
+
+---
+
+### SystemManager_ClearCache.py
+
+Python conversion of the legacy MicroStrategy **System Manager**
+`MarketIntelligence_ClearCache` workflow. Designed for the MicroStrategy
+Cloud Environment (MCE) Python runtime so the same automation can run inside
+the platform after an MCE migration removes the System Manager process.
+
+**Workflow steps** (all driven from a single YAML config):
+
+1. Run **CheckIfMIDWHRefreshHappened** — exits cleanly if no DWH refresh is
+   outstanding.
+2. Run **RetrieveIDs** — pulls the comma-separated `MIDWHLoadHistoryIds`.
+3. **Invalidate** all loaded ("ready") report caches in the project via the
+   mstrio-py `ContentCache` SDK (bulk call).
+4. Execute the `IndicateCacheDropHappened` stored procedure with the IDs
+   passed as a prompt answer.
+5. Trigger the **Refresh Cubes** event.
+6. Trigger the **Notify users** event (best effort).
+7. On any SQL / cache / event-trigger failure, send a high-importance email.
+
+#### Why Freeform SQL (not direct ODBC)?
+
+The MCE Python runtime does **not** ship `pyodbc` / `pymssql`, and database
+credentials should not live in Python. Instead, each SQL statement is
+pre-created as a **Freeform SQL report** in the project, pointing at the
+correct datasource. Only the report GUIDs change per project — the same
+script template runs against any project / database.
+
+| Report | SQL |
+|---|---|
+| `check_refresh` | `SELECT TOP 1 case when MIDWHLoadHistoryId is not null then 1 else 0 end ...` |
+| `retrieve_ids` | The XML-PATH concat returning `MILoadIDs` |
+| `indicate_cache_drop` | `EXEC IndicateCacheDropHappened ?[MIDWHLoadHistoryIds]; SELECT 1 AS Status;` |
+
+The `indicate_cache_drop` report **must** include a trailing dummy
+`SELECT 1 AS Status;` so it qualifies as a Freeform SQL report (FFSQL
+requires a result set), and **must** declare a single VALUE prompt whose
+key/title matches `freeform_sql_reports.indicate_cache_drop_prompt_key`
+(default: `MIDWHLoadHistoryIds`).
+
+#### Usage
+
+```
+python SystemManager_ClearCache.py [--config PATH] [--apply]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `--config PATH` | No | YAML config file (default: `system_manager_clear_cache_config.yaml`) |
+| `--apply` | No | Execute mutating steps. Without it, the script runs in **dry run** — the two read-only reports still execute so the dry run reflects real state, but cache invalidation, the SP call, and event triggers are only logged. |
+
+```bash
+# Dry run with the bundled config
+python SystemManager_ClearCache.py
+
+# Execute the workflow
+python SystemManager_ClearCache.py --apply
+
+# Run a different project's workflow (e.g. crop_eu)
+python SystemManager_ClearCache.py --config crop_eu.yaml --apply
+```
+
+#### Config file (`system_manager_clear_cache_config.yaml`)
+
+Each per-project workflow gets its own YAML file. Required keys:
+
+| Key | Description |
+|---|---|
+| `env` | MicroStrategy environment: `dev`, `qa`, or `prod` |
+| `project.name` *or* `project.id` | Target project |
+| `freeform_sql_reports.check_refresh` | Report GUID |
+| `freeform_sql_reports.retrieve_ids` | Report GUID |
+| `freeform_sql_reports.indicate_cache_drop` | Report GUID (with one VALUE prompt) |
+| `freeform_sql_reports.indicate_cache_drop_prompt_key` | Prompt key/title (default `MIDWHLoadHistoryIds`) |
+| `events.refresh_cubes` | I-Server event name |
+| `events.notify` | I-Server event name |
+
+Optional keys (failure email — silently skipped if blank):
+
+| Key | Description |
+|---|---|
+| `notification.on_failure_email` | Recipient |
+| `notification.smtp_server` / `smtp_port` | SMTP host (port default 25) |
+| `notification.from_address` | From header |
+| `notification.use_tls` | true/false |
+| `notification.smtp_username` / `smtp_password` | Optional SMTP auth |
+
+MicroStrategy connection credentials come from the standard `MSTR_*` env
+vars (`.env`) — they are **not** in the workflow YAML.
+
+#### MCE Python runtime considerations
+
+| Concern | Behaviour |
+|---|---|
+| `pyodbc` / `pymssql` not bundled | SQL goes through Freeform SQL reports — no DB drivers needed |
+| Outbound SMTP often blocked | Email send is wrapped in `try/except`; on failure logs an error and the script still exits non-zero so the calling MCE Workflow can escalate |
+| `mstrio-py` is bundled | Used directly for `ContentCache.invalidate_caches(...)` and `Event(...).trigger()` |
+| `mstrio-py` 11.4+ required | `mstrio.project_objects.content_cache` is needed for cache invalidation |
+| Limited file system | The script writes only log output via `loguru` to `MSTR_LOG_DIR` (default `logs/`) |
+| `workstationData` injection | If running embedded in Workstation, replace `_build_session()` with `get_connection(workstationData)` and a session shim |
+
+#### Failure handling
+
+| Step | On failure |
+|---|---|
+| `CheckIfMIDWHRefreshHappened` | Email + exit 1 |
+| `RetrieveIDs` | Email + exit 1 |
+| Cache invalidation | Email + exit 1 |
+| `IndicateCacheDropHappened` | Email + exit 1 |
+| Trigger refresh-cubes event | Email + exit 1 |
+| Trigger notify event | Logged warning only (best-effort, exit 0) |
+
+---
+
+### ExecuteObjects.py
+
+Concurrently execute MicroStrategy objects (Reports, Documents, Dossiers,
+Intelligent Cubes) for testing / smoke-testing purposes. Reads a list of
+`(project_id, object_id)` rows, resolves their definitions, optionally
+captures prompt structure as JSON for the user to fill in, then runs them in
+parallel and updates the same CSV with execution status as work progresses.
+
+#### Two phases
+
+1. **Pre-flight** — for every input row:
+   - Resolve project name (cached).
+   - Resolve `object_name`, `object_type`, `object_subtype`, folder
+     `object_location`.
+   - Classify as **Report**, **Document**, **Dossier**, or **Cube**
+     (see classification table below).
+   - If the object has prompts, capture their definitions as a JSON
+     template in `prompt_answers_json` for later editing.
+   - If no prompts (or cubes), set `prompt_answers_json = "Prompts:None"`.
+   - If the object is unsupported / cannot be resolved, mark `status =
+     skipped` with the reason in `status_details`.
+   - Write the populated CSV.
+
+2. **Execute** — schedule every row whose status is not `success` or
+   `skipped` on a `ThreadPoolExecutor`. Each worker:
+   - Marks `start_time` + `status=running` and flushes the CSV.
+   - Creates an instance via the appropriate REST endpoint:
+     - Reports → `POST /v2/reports/{id}/instances`
+     - Documents/Dossiers → `POST /v2/documents/{id}/instances`
+     - Cubes → `mstrio.project_objects.datasets.OlapCube(...).publish()`
+       (REST fallback: `POST /cubes/{id}/instances`)
+   - If prompts are pending or the user supplied answers, sends
+     `closeAllPrompts: true` plus any user answers via
+     `PUT /reports|/documents/{id}/instances/{iid}/prompts/answers`.
+   - On success → `status=success` + `end_time` + result detail.
+     On failure → `status=error` + error message in `status_details`.
+   - Flushes the CSV after every state change so the file is a live
+     progress snapshot.
+
+#### Object classification
+
+| Type | Subtype | Classified as | Endpoint |
+|---|---|---|---|
+| 3 | 768/769/770/771/774 | `Report` | `/v2/reports/{id}/instances` |
+| 3 | 776 | `Cube` | `OlapCube.publish()` (REST fallback `/cubes/{id}/instances`) |
+| 55 | 14080 | `Document` | `/v2/documents/{id}/instances` |
+| 55 | 14081 | `Dossier` | `/v2/documents/{id}/instances` |
+
+#### Prompt handling rules
+
+- **User-supplied answers** in `prompt_answers_json` are used verbatim.
+- **Unanswered prompts** receive defaults via `closeAllPrompts: true` —
+  prompts with defaults will fall back to those.
+- **Optional prompts** without defaults are not answered (skipped).
+- **Required prompts** with no default and no user answer cause the
+  execution to error — the underlying I-Server returns a prompt-required
+  failure which the worker captures in `status_details`.
+
+#### CSV schema
+
+The output CSV (which is also a valid input for resume mode) has these
+columns, in order:
+
+| Column | Meaning |
+|---|---|
+| `project_id` | Project GUID |
+| `project_name` | Project display name (cached lookup) |
+| `object_id` | Object GUID |
+| `object_name` | Object display name |
+| `object_location` | Folder path (e.g. `\Public Objects\Reports\Sales`) |
+| `object_type` | `Report` / `Document` / `Dossier` / `Cube` |
+| `start_time` | UTC ISO timestamp when the worker began |
+| `end_time` | UTC ISO timestamp when the worker finished |
+| `status` | empty / `running` / `success` / `error` / `skipped` |
+| `status_details` | Error message or success detail |
+| `prompt_answers_json` | Prompt template (pre-flight) or user answers (input) |
+
+#### `prompt_answers_json` formats
+
+| Value | Meaning |
+|---|---|
+| `Prompts:None` | Object has no prompts (or cube — never prompted) |
+| `{"prompts":[ ...templates... ]}` | Pre-flight template; each entry has `key`, `name`, `title`, `type`, `required`, `hasDefault`, `answers:[]` |
+| `{"prompts":[ ...answer payloads... ]}` | User-provided answers; sent verbatim to `PUT /prompts/answers` |
+
+User-supplied answer entry shape:
+
+```json
+{"key":"countryPromptKey","type":"ELEMENTS","answers":[{"value":"USA"}]}
+```
+
+#### Resume mode
+
+Feed a previous run's output CSV back in via `--input`. Behaviour:
+
+- Rows with `status = success` are preserved untouched.
+- Rows with `status = skipped` are preserved (won't auto-retry; fix the
+  input first).
+- Rows with `status = error`, `running`, or empty are re-executed.
+
+The same `--output` file (or default) is rewritten in place.
+
+#### Concurrency / threading
+
+- Single shared `MstrRestSession` is used (`requests.Session` is
+  thread-safe).
+- `session.set_project()` is **not** called in workers — every request
+  carries its own `X-MSTR-ProjectID` header, so different projects can
+  run in parallel without racing.
+- CSV writes are serialized with a `Lock` and use a temp-file rename for
+  atomic updates (the file always reflects a consistent state, even if
+  the script is interrupted).
+
+#### Usage
+
+```
+python ExecuteObjects.py <env> --input PATH [options]
+```
+
+| Argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--input PATH`, `-i` | Yes | Input CSV — minimum: `project_id`, `object_id` (and optional `prompt_answers_json`); or a previous run's output CSV for resume |
+| `--output PATH`, `-o` | No | Output CSV path (default: `<output_dir>/execute_objects_results.csv`) |
+| `--concurrency N`, `-c` | No | Parallel workers (default: 10) |
+| `--preflight-only` | No | Stop after writing the populated CSV; do not execute |
+| `--timeout SECONDS` | No | Per-object timeout (default: 600 = 10 min) |
+| `--output-dir PATH` | No | Override `MSTR_OUTPUT_DIR` for default output location |
+
+#### Examples
+
+```bash
+# First run — minimal input (just project_id, object_id)
+python ExecuteObjects.py dev --input objects.csv
+
+# Pre-flight only — gather definitions + prompt templates, edit, then run later
+python ExecuteObjects.py dev --input objects.csv --preflight-only
+
+# Resume — re-run anything that didn't complete successfully
+python ExecuteObjects.py dev --input execute_objects_results.csv --concurrency 20
+
+# Higher concurrency, custom output, stricter timeout
+python ExecuteObjects.py prod -i objects.csv -o /tmp/run1.csv -c 25 --timeout 300
+```
+
+**Sample input** (`execute_objects_sample.csv`): 3 objects, mixed prompt
+states — minimal columns plus a row with pre-filled answers.
 
 ---
 
