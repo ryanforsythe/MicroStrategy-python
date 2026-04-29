@@ -335,6 +335,75 @@ def _fetch_ancestors(session: MstrRestSession, project_id: str, object_id: str, 
     return ""
 
 
+def _fetch_object_prompts(
+    session: MstrRestSession,
+    project_id: str,
+    object_id: str,
+    kind: str,
+) -> Optional[list[dict]]:
+    """
+    Return the raw prompt definitions for an object, or None if the object
+    has no prompts (or all probe paths failed).
+
+    Tries the v2 path first; falls back to v1 with `?closed=false` because
+    v2 is not exposed on every I-Server version. Uses the raw
+    `requests.Session` to suppress noisy WARNING logs from
+    `MstrRestSession._request()` (a 404 means "no prompts" or "v2 unavailable",
+    both of which are expected).
+    """
+    if kind == KIND_CUBE:
+        return None
+
+    if kind == KIND_REPORT:
+        candidates = [
+            (f"/v2/reports/{object_id}/prompts", None),
+            (f"/reports/{object_id}/prompts", {"closed": "false"}),
+        ]
+    elif kind == KIND_DOSSIER:
+        candidates = [
+            (f"/v2/dossiers/{object_id}/prompts", None),
+            (f"/dossiers/{object_id}/prompts", {"closed": "false"}),
+        ]
+    elif kind == KIND_DOCUMENT:
+        candidates = [
+            (f"/v2/documents/{object_id}/prompts", None),
+            (f"/documents/{object_id}/prompts", {"closed": "false"}),
+        ]
+    else:
+        return None
+
+    headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
+
+    last_status: Optional[int] = None
+    for path, params in candidates:
+        url = session.api_url + path
+        try:
+            r = session._session.get(url, headers=headers, params=params, timeout=30)
+        except Exception as exc:
+            logger.debug("Prompt probe error for {oid} at {p}: {exc}", oid=object_id, p=path, exc=exc)
+            continue
+        last_status = r.status_code
+        if r.status_code == 404:
+            # Path not present on this I-Server; try the next candidate.
+            continue
+        if not r.ok:
+            logger.debug("Prompt probe HTTP {s} for {oid} at {p}", s=r.status_code, oid=object_id, p=path)
+            continue
+        try:
+            data = r.json()
+        except Exception:
+            continue
+        prompts = data if isinstance(data, list) else (data.get("prompts") or [])
+        # Successful response — return what we found (could be empty list)
+        return prompts
+
+    logger.debug(
+        "No prompts located for {oid} ({k}) — last HTTP={s}",
+        oid=object_id, k=kind, s=last_status,
+    )
+    return None
+
+
 def _fetch_prompts_template(
     session: MstrRestSession,
     project_id: str,
@@ -343,45 +412,37 @@ def _fetch_prompts_template(
 ) -> str:
     """
     Return a JSON template of prompt definitions for the user to fill in,
-    or PROMPTS_NONE if the object has no prompts / can't be fetched.
+    or PROMPTS_NONE if the object has no prompts / probe failed.
     """
-    if kind == KIND_CUBE:
+    prompts = _fetch_object_prompts(session, project_id, object_id, kind)
+    if not prompts:
         return PROMPTS_NONE
 
-    if kind == KIND_REPORT:
-        path = f"/v2/reports/{object_id}/prompts"
-    elif kind in (KIND_DOCUMENT, KIND_DOSSIER):
-        path = f"/v2/documents/{object_id}/prompts"
-    else:
-        return PROMPTS_NONE
+    # `defaultAnswer` may be a non-empty scalar/list (truly has a default)
+    # or [] / "" / None (no usable default).
+    def _has_default(p: dict) -> bool:
+        d = p.get("defaultAnswer")
+        if d in (None, "", []):
+            d2 = p.get("defaultAnswers")
+            return d2 not in (None, "", [])
+        return True
 
-    try:
-        r = _project_request(session, "GET", path, project_id)
-        if not r.ok:
-            return PROMPTS_NONE
-        data = r.json()
-        prompts = data if isinstance(data, list) else (data.get("prompts") or [])
-        if not prompts:
-            return PROMPTS_NONE
-        # Slimmed-down template — user fills `answers`
-        template = {
-            "prompts": [
-                {
-                    "key": p.get("key") or p.get("id"),
-                    "name": p.get("name", ""),
-                    "title": p.get("title", ""),
-                    "type": p.get("type", ""),
-                    "required": bool(p.get("required", False)),
-                    "hasDefault": bool(p.get("defaultAnswer") or p.get("defaultAnswers")),
-                    "answers": [],
-                }
-                for p in prompts
-            ]
-        }
-        return json.dumps(template, ensure_ascii=False)
-    except Exception as exc:
-        logger.debug("Prompt fetch failed for {oid}: {exc}", oid=object_id, exc=exc)
-        return PROMPTS_NONE
+    template = {
+        "prompts": [
+            {
+                "key": p.get("key") or p.get("id"),
+                "id": p.get("id", ""),
+                "name": p.get("name", ""),
+                "title": p.get("title", ""),
+                "type": p.get("type", ""),
+                "required": bool(p.get("required", False)),
+                "hasDefault": _has_default(p),
+                "answers": [],
+            }
+            for p in prompts
+        ]
+    }
+    return json.dumps(template, ensure_ascii=False)
 
 
 def _build_initial_rows(
@@ -526,6 +587,55 @@ def _extract_user_prompt_answers(raw: str) -> Optional[list[dict]]:
     return answered or None
 
 
+def _build_answer_payload(
+    prompts_list: list[dict],
+    user_answers: Optional[list[dict]],
+) -> list[dict]:
+    """
+    Build the `prompts` array for `PUT .../prompts/answers`.
+
+    Per-prompt resolution:
+        1. If the user supplied an entry (matched by `key` or `id`) with a
+           non-empty `answers` list → use those answers.
+        2. Otherwise → emit `useDefault: true`. The I-Server applies the
+           configured default if there is one; for optional prompts with no
+           default it answers empty (no filter); for required prompts with no
+           default it errors back, which we surface as the row's failure.
+
+    The returned list always has one entry per prompt — never empty when
+    `prompts_list` is non-empty — so the API's "prompts cannot be null or
+    empty" constraint is always satisfied.
+    """
+    by_key: dict[str, dict] = {}
+    by_id: dict[str, dict] = {}
+    for p in user_answers or []:
+        if p.get("key"):
+            by_key[p["key"]] = p
+        if p.get("id"):
+            by_id[p["id"]] = p
+
+    out: list[dict] = []
+    for p in prompts_list:
+        pkey = p.get("key")
+        pid = p.get("id")
+        ptype = p.get("type") or ""
+
+        entry: dict[str, Any] = {"type": ptype}
+        if pkey:
+            entry["key"] = pkey
+        if pid:
+            entry["id"] = pid
+
+        user = (by_key.get(pkey) if pkey else None) or (by_id.get(pid) if pid else None)
+        if user and user.get("answers"):
+            entry["answers"] = user["answers"]
+        else:
+            entry["useDefault"] = True
+
+        out.append(entry)
+    return out
+
+
 def _execute_report_or_doc(
     session: MstrRestSession,
     project_id: str,
@@ -533,34 +643,57 @@ def _execute_report_or_doc(
     kind: str,
     user_prompt_answers: Optional[list[dict]],
 ) -> str:
-    """Create an instance for a Report/Document/Dossier; close prompts with defaults."""
-    base_v2 = "/v2/reports" if kind == KIND_REPORT else "/v2/documents"
-    base_v1 = "/reports" if kind == KIND_REPORT else "/documents"
+    """
+    Create an instance for a Report/Document/Dossier and answer any prompts.
 
+    Endpoint paths differ by object kind. Even though Documents and Dossiers both
+    have metadata type=55, the REST API exposes them under distinct path roots:
+        Report   → /v2/reports/{id}/instances
+        Document → /v2/documents/{id}/instances
+        Dossier  → /v2/dossiers/{id}/instances     (NOT /documents/)
+    Using /v2/documents/ for a dossier returns HTTP 404.
+
+    Flow:
+        1. Fetch the prompts list (v2 → v1 fallback).
+        2. POST instance.
+        3. If the object has prompts, build a complete answer payload (user
+           answers OR `useDefault:true` for every prompt) and PUT it, then
+           re-execute the instance.
+        4. GET the instance to confirm a terminal state.
+    """
+    if kind == KIND_REPORT:
+        base_v2, base_v1 = "/v2/reports", "/reports"
+    elif kind == KIND_DOSSIER:
+        base_v2, base_v1 = "/v2/dossiers", "/dossiers"
+    else:  # KIND_DOCUMENT
+        base_v2, base_v1 = "/v2/documents", "/documents"
+
+    # 1. Pull the actual prompt definitions so we can answer every one.
+    prompts_list = _fetch_object_prompts(session, project_id, object_id, kind) or []
+
+    # 2. Create the instance.
     r = _project_request(session, "POST", f"{base_v2}/{object_id}/instances", project_id, json={})
     if not r.ok:
         raise RuntimeError(f"Instance create failed: HTTP {r.status_code} {r.text[:300]}")
     payload = r.json()
     instance_id = payload.get("instanceId")
+    if not instance_id:
+        raise RuntimeError(f"Instance create returned no instanceId: {payload}")
 
-    # If prompts are pending, answer them
-    pr_status = payload.get("status")
-    needs_prompts = pr_status == 2 or "prompt" in str(payload.get("prompts") or "").lower()
-    if needs_prompts or user_prompt_answers:
-        body: dict[str, Any] = {"closeAllPrompts": True}
-        if user_prompt_answers:
-            body["prompts"] = user_prompt_answers
+    # 3. Answer prompts (if any) — always full payload, never empty.
+    if prompts_list:
+        answers_payload = _build_answer_payload(prompts_list, user_prompt_answers)
         ar = _project_request(
             session, "PUT",
             f"{base_v1}/{object_id}/instances/{instance_id}/prompts/answers",
-            project_id, json=body,
+            project_id, json={"prompts": answers_payload},
         )
-        # Some I-Servers return 204; some 200. Anything 2xx is OK.
         if ar.status_code >= 400:
             raise RuntimeError(
                 f"Prompt-answer failed: HTTP {ar.status_code} {ar.text[:300]}"
             )
-        # Re-execute to materialise the result
+
+        # Re-execute so the answers materialise in the instance.
         re = _project_request(
             session, "POST", f"{base_v2}/{object_id}/instances/{instance_id}",
             project_id, json={},
@@ -568,7 +701,7 @@ def _execute_report_or_doc(
         if not re.ok:
             raise RuntimeError(f"Instance re-execute failed: HTTP {re.status_code} {re.text[:300]}")
 
-    # Confirm the instance reached a terminal state with a small fetch
+    # 4. Confirm a terminal state with a tiny fetch.
     fr = _project_request(
         session, "GET", f"{base_v2}/{object_id}/instances/{instance_id}",
         project_id, params={"limit": 1},
