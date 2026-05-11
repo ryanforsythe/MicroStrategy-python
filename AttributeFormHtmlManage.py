@@ -83,7 +83,7 @@ from mstrio_core import MstrConfig, MstrRestSession, object_location
 from mstrio_core.config import MstrEnvironment
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# --Constants --───────────────────────────────────────────────────────────────
 
 OBJECT_TYPE_ATTRIBUTE = 12
 
@@ -116,7 +116,7 @@ DEFAULT_CONCURRENCY = 10
 DEFAULT_OUTPUT_NAME = "attribute_form_html.csv"
 
 
-# ── Small helpers ─────────────────────────────────────────────────────────────
+# --Small helpers --───────────────────────────────────────────────────────────
 
 
 def _project_request(session: MstrRestSession, method: str, path: str, project_id: str, **kwargs):
@@ -133,7 +133,7 @@ def _project_request(session: MstrRestSession, method: str, path: str, project_i
     raise ValueError(f"Unsupported method: {method}")
 
 
-# ── Expression parsing ────────────────────────────────────────────────────────
+# --Expression parsing --──────────────────────────────────────────────────────
 
 _DOC_ID_RE = re.compile(r"documentID=([0-9A-Fa-f]{32})")
 _ELEMENT_ATTR_RE = re.compile(r"elementsPromptAnswers=([0-9A-Fa-f]{32})")
@@ -177,7 +177,7 @@ def parse_html_link_expression(expr: str) -> dict:
     return out
 
 
-# ── New expression builder ────────────────────────────────────────────────────
+# --New expression builder --──────────────────────────────────────────────────
 
 # URL-encoded JSON skeleton for `?prompts=[[{"key":"…","values":["…:…"],"useDefault":false}]]`
 _JSON_OPEN = "%5B%5B%7B%22key%22%3A%22"
@@ -229,7 +229,7 @@ def build_new_form_expression(
     )
 
 
-# ── Document prompt lookup ────────────────────────────────────────────────────
+# --Document prompt lookup --──────────────────────────────────────────────────
 
 
 def find_doc_prompt_by_source_attr(
@@ -276,7 +276,7 @@ def find_doc_prompt_by_source_attr(
     return "", ""
 
 
-# ── Attribute search / detail fetch ───────────────────────────────────────────
+# --Attribute search / detail fetch --─────────────────────────────────────────
 
 
 def _expression_text(expr_obj: dict) -> str:
@@ -390,7 +390,7 @@ def _fetch_attribute_def(
     return None
 
 
-# ── Export workflow ───────────────────────────────────────────────────────────
+# --Export workflow --─────────────────────────────────────────────────────────
 
 
 def _process_attribute(
@@ -511,7 +511,15 @@ def _build_rows_for_project(
     return rows
 
 
+def _enable_verbose() -> None:
+    """Add a DEBUG-level stderr handler on top of the default INFO one."""
+    logger.add(sys.stderr, level="DEBUG", colorize=True)
+
+
 def cmd_export(args: argparse.Namespace) -> int:
+    if getattr(args, "verbose", False):
+        _enable_verbose()
+
     config = MstrConfig(environment=MstrEnvironment(args.env))
     output_path = args.output or (config.output_dir / DEFAULT_OUTPUT_NAME)
 
@@ -524,6 +532,12 @@ def cmd_export(args: argparse.Namespace) -> int:
             logger.error("--modified-since must be YYYY-MM-DD; got: {v}", v=args.modified_since)
             return 2
         logger.info("Filtering by modifiedSince={iso}", iso=modified_since_iso)
+
+    attribute_id_filter = None
+    if getattr(args, "attribute_id", None):
+        attribute_id_filter = {a.strip().upper() for a in args.attribute_id}
+        logger.info("Limiting to {n} attribute GUID(s): {ids}",
+                    n=len(attribute_id_filter), ids=sorted(attribute_id_filter))
 
     with MstrRestSession(config) as session:
         all_projects = _list_loaded_projects(session)
@@ -546,9 +560,30 @@ def cmd_export(args: argparse.Namespace) -> int:
             if not pid:
                 continue
             try:
-                rows = _build_rows_for_project(
-                    session, pid, pname, modified_since_iso, args.concurrency,
-                )
+                if attribute_id_filter is not None:
+                    # Skip the search — fetch each ID directly. Saves one
+                    # round trip per project and lets the user iterate fast.
+                    attrs = [{"id": aid, "name": "", "ancestors": []}
+                             for aid in attribute_id_filter]
+                    rows = []
+                    rows_lock = threading.Lock()
+
+                    def _w(a, _pid=pid, _pname=pname):
+                        try:
+                            sub = _process_attribute(session, _pid, _pname, a)
+                        except Exception as exc:
+                            logger.warning("Attribute {aid} failed: {exc}", aid=a["id"], exc=exc)
+                            return
+                        if sub:
+                            with rows_lock:
+                                rows.extend(sub)
+
+                    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+                        list(pool.map(_w, attrs))
+                else:
+                    rows = _build_rows_for_project(
+                        session, pid, pname, modified_since_iso, args.concurrency,
+                    )
                 logger.success("Project {p}: {n} HTML form(s) captured.", p=pname, n=len(rows))
                 all_rows.extend(rows)
             except Exception as exc:
@@ -566,7 +601,206 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
-# ── Apply workflow ────────────────────────────────────────────────────────────
+# --Debug workflow --──────────────────────────────────────────────────────────
+
+
+def _dump_json(label: str, obj: Any) -> None:
+    print(f"\n--{label} --")
+    print(json.dumps(obj, indent=2, default=str))
+
+
+def cmd_debug(args: argparse.Namespace) -> int:
+    """
+    Fetch one attribute and walk the entire export pipeline verbosely,
+    printing the raw API response, form classification, expression parsing,
+    prompt lookup, and the generated NewFormExpression — without writing
+    a CSV. Use to troubleshoot an individual attribute end-to-end.
+    """
+    if args.verbose:
+        _enable_verbose()
+
+    config = MstrConfig(environment=MstrEnvironment(args.env))
+    pid = args.project_id.strip()
+    aid = args.attribute_id.strip()
+
+    print(f"\n==============================================================")
+    print(f"  DEBUG  project={pid}  attribute={aid}  env={args.env}")
+    print(f"==============================================================")
+
+    with MstrRestSession(config) as session:
+        # 1. Fetch attribute definition
+        print("\n[1/4] Fetching /model/attributes/{id}...")
+        defn = _fetch_attribute_def(session, pid, aid)
+        if not defn:
+            print("  - FAILED — attribute not found or fetch error.")
+            print("    Possible causes: wrong project_id, wrong attribute_id,")
+            print("    user lacks read permission, attribute is in unloaded project.")
+            return 1
+
+        info = defn.get("information") or {}
+        forms = defn.get("forms") or []
+        print(f"  + Name:           {info.get('name')!r}")
+        print(f"    SubType:        {info.get('subType')!r}")
+        print(f"    Date Modified:  {info.get('dateModified')!r}")
+        print(f"    Forms total:    {len(forms)}")
+
+        if args.show_raw:
+            _dump_json("RAW attribute JSON", defn)
+
+        # 2. Classify each form
+        print("\n[2/4] Classifying forms by displayFormat / expression markers:")
+        html_forms = []
+        for i, form in enumerate(forms):
+            fid = form.get("id")
+            fname = form.get("name")
+            fmt = form.get("displayFormat")
+            cat = form.get("category")
+            is_html = _is_html_form(form)
+            marker = "+ HTML" if is_html else "  --  "
+            print(f"  [{i:2}] {marker}  {fname!r:35} id={fid}")
+            print(f"           category={cat!r}  displayFormat={fmt!r}")
+            if is_html:
+                html_forms.append(form)
+
+        if not html_forms:
+            print("\n  - No HTML forms on this attribute. Nothing to convert.")
+            return 0
+
+        # 3. Per-HTML-form parse + prompt lookup + NewFormExpression
+        for form in html_forms:
+            fid = form.get("id")
+            fname = form.get("name")
+            print(f"\n[3/4] Processing HTML form: {fname!r} ({fid})")
+
+            exprs = form.get("expressions") or []
+            if not exprs:
+                print("  - Form has no expressions array.")
+                continue
+
+            text = _expression_text(exprs[0])
+            print("\n  expression.text:")
+            print(f"    {text}")
+
+            parsed = parse_html_link_expression(text)
+            print("\n  parsed:")
+            for k, v in parsed.items():
+                marker = "+" if v else "-"
+                print(f"    {marker} {k:35} = {v!r}")
+
+            tgt = parsed["target_document_id"]
+            elem = parsed["element_target_attribute_id"]
+            prompt_id, prompt_key = "", ""
+            if tgt and elem:
+                print(f"\n  Prompt lookup: /documents/{tgt}/prompts  source.id == {elem}")
+                if args.show_doc_prompts:
+                    # Dump the entire prompts list for the target document
+                    candidates = [
+                        (f"/v2/documents/{tgt}/prompts", None),
+                        (f"/documents/{tgt}/prompts", {"closed": "false"}),
+                    ]
+                    headers = {**session.server_headers, "X-MSTR-ProjectID": pid}
+                    for path, params in candidates:
+                        try:
+                            r = session._session.get(
+                                session.api_url + path, headers=headers,
+                                params=params, timeout=30,
+                            )
+                        except Exception as exc:
+                            print(f"    {path} → exception: {exc}")
+                            continue
+                        if r.status_code == 404:
+                            print(f"    {path} → HTTP 404 (try next)")
+                            continue
+                        if not r.ok:
+                            print(f"    {path} → HTTP {r.status_code}  {r.text[:200]}")
+                            continue
+                        try:
+                            data = r.json()
+                        except Exception:
+                            continue
+                        prompts = data if isinstance(data, list) else (data.get("prompts") or [])
+                        _dump_json(f"Document prompts ({path})", prompts)
+                        break
+                prompt_id, prompt_key = find_doc_prompt_by_source_attr(
+                    session, pid, tgt, elem,
+                )
+                m1 = "+" if prompt_id else "-"
+                m2 = "+" if prompt_key else "-"
+                print(f"    {m1} promptId   = {prompt_id!r}")
+                print(f"    {m2} promptKey  = {prompt_key!r}")
+            else:
+                print("\n  Prompt lookup skipped (missing target_document_id or element_target_attribute_id).")
+
+            # 4. Build the new expression
+            print("\n[4/4] Building NewFormExpression:")
+            new_expr = build_new_form_expression(
+                target_doc_id=tgt,
+                display_form=parsed["target_value_name"],
+                value_form=parsed["target_value_id"],
+                element_target_attr_id=elem,
+                prompt_key=prompt_key,
+            )
+            if new_expr:
+                print(f"  + NewFormExpression:\n    {new_expr}")
+            else:
+                missing = [
+                    name for name, val in [
+                        ("target_doc_id", tgt),
+                        ("display_form", parsed["target_value_name"]),
+                        ("value_form", parsed["target_value_id"]),
+                        ("element_target_attr_id", elem),
+                        ("prompt_key", prompt_key),
+                    ] if not val
+                ]
+                print(f"  - Skipped — missing: {missing}")
+
+    print("\n==============================================================\n")
+    return 0
+
+
+# --Offline parse/build test --────────────────────────────────────────────────
+
+
+def cmd_parse(args: argparse.Namespace) -> int:
+    """
+    Test the regex parser + new-expression builder against an arbitrary
+    expression text — no server calls. Useful when iterating on regexes
+    or debugging an exotic expression captured from the CSV.
+    """
+    if args.text:
+        text = args.text
+    elif args.text_file:
+        text = Path(args.text_file).read_text(encoding="utf-8")
+    else:
+        print("Provide --text 'Concat(...)' or --text-file PATH.")
+        return 2
+
+    print("\nINPUT expression text:")
+    print(f"  {text}")
+
+    parsed = parse_html_link_expression(text)
+    print("\nPARSED fields:")
+    for k, v in parsed.items():
+        marker = "+" if v else "-"
+        print(f"  {marker} {k:35} = {v!r}")
+
+    new = build_new_form_expression(
+        target_doc_id=parsed["target_document_id"],
+        display_form=parsed["target_value_name"],
+        value_form=parsed["target_value_id"],
+        element_target_attr_id=parsed["element_target_attribute_id"],
+        prompt_key=args.prompt_key or "<PROMPT_KEY_FROM_DOC_LOOKUP>",
+    )
+    print("\nBUILT NewFormExpression:")
+    if new:
+        print(f"  {new}")
+    else:
+        print("  (blank — required pieces missing; pass --prompt-key to simulate)")
+    print()
+    return 0
+
+
+# --Apply workflow --──────────────────────────────────────────────────────────
 
 
 def _read_csv_rows(path: Path) -> list[dict]:
@@ -733,7 +967,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0 if errors == 0 else 1
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# --CLI --─────────────────────────────────────────────────────────────────────
 
 
 def parse_args() -> argparse.Namespace:
@@ -753,10 +987,16 @@ def parse_args() -> argparse.Namespace:
                     help=f"Output CSV (default: <output_dir>/{DEFAULT_OUTPUT_NAME}).")
     pe.add_argument("--project", nargs="+", default=None,
                     help="Limit to specific project GUIDs (default: all loaded projects).")
+    pe.add_argument("--attribute-id", nargs="+", default=None,
+                    help="Limit to specific attribute GUIDs — skips the project-wide "
+                         "search and fetches each ID directly. Combine with --project "
+                         "to scope.")
     pe.add_argument("--modified-since", default=None,
                     help="Only include attributes modified on/after YYYY-MM-DD.")
     pe.add_argument("--concurrency", "-c", type=int, default=DEFAULT_CONCURRENCY,
                     help=f"Parallel attribute fetches per project (default: {DEFAULT_CONCURRENCY}).")
+    pe.add_argument("--verbose", "-v", action="store_true",
+                    help="Enable DEBUG-level stderr logging.")
     pe.set_defaults(func=cmd_export)
 
     pa = sub.add_parser("apply", help="Apply NewFormExpression updates from CSV.")
@@ -765,7 +1005,35 @@ def parse_args() -> argparse.Namespace:
                     help="CSV produced by `export` with NewFormExpression populated.")
     pa.add_argument("--apply", action="store_true",
                     help="Commit changes (default: dry-run).")
+    pa.add_argument("--verbose", "-v", action="store_true",
+                    help="Enable DEBUG-level stderr logging.")
     pa.set_defaults(func=cmd_apply)
+
+    pd = sub.add_parser(
+        "debug",
+        help="Fetch one attribute and walk the full pipeline verbosely.",
+    )
+    pd.add_argument("env", choices=[e.value for e in MstrEnvironment])
+    pd.add_argument("--project-id", required=True, help="Project GUID containing the attribute.")
+    pd.add_argument("--attribute-id", required=True, help="Attribute GUID to inspect.")
+    pd.add_argument("--show-raw", action="store_true",
+                    help="Print the full raw /model/attributes/{id} response as JSON.")
+    pd.add_argument("--show-doc-prompts", action="store_true",
+                    help="Print the full prompts list for the target document.")
+    pd.add_argument("--verbose", "-v", action="store_true",
+                    help="Enable DEBUG-level stderr logging.")
+    pd.set_defaults(func=cmd_debug)
+
+    pp = sub.add_parser(
+        "parse",
+        help="Test regex parser + builder on an expression text (no server calls).",
+    )
+    src = pp.add_mutually_exclusive_group(required=True)
+    src.add_argument("--text", help="Expression text to parse.")
+    src.add_argument("--text-file", help="Path to a file containing the expression text.")
+    pp.add_argument("--prompt-key", default=None,
+                    help="Simulate a prompt key for NewFormExpression preview.")
+    pp.set_defaults(func=cmd_parse)
 
     return p.parse_args()
 
