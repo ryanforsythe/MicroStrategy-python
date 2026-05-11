@@ -143,8 +143,9 @@ _VALUE_REF_RE = re.compile(
     r'"\s*,\s*'
     r'(?:ToString\s*\(\s*)?([A-Za-z_][A-Za-z0-9_ ]*?)\s*[\),]'
 )
-# Display name: title=""",NAME,
-_DISPLAY_REF_RE = re.compile(r'title="""\s*,\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*,')
+# Display name candidates — try title= first, then the link text right before </a>
+_DISPLAY_TITLE_RE = re.compile(r'title="""\s*,\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*,')
+_LINK_TEXT_RE = re.compile(r',\s*([A-Za-z_][A-Za-z0-9_ ]*?)\s*,\s*"</a>"')
 
 
 def parse_html_link_expression(expr: str) -> dict:
@@ -165,9 +166,14 @@ def parse_html_link_expression(expr: str) -> dict:
     m = _VALUE_REF_RE.search(s)
     if m:
         out["target_value_id"] = m.group(1).strip()
-    m = _DISPLAY_REF_RE.search(s)
+    # Prefer the link text (always present in <a>...</a>), fall back to title=
+    m = _LINK_TEXT_RE.search(s)
     if m:
         out["target_value_name"] = m.group(1).strip()
+    else:
+        m = _DISPLAY_TITLE_RE.search(s)
+        if m:
+            out["target_value_name"] = m.group(1).strip()
     return out
 
 
@@ -187,15 +193,17 @@ def build_new_form_expression(
     element_target_attr_id: str,
     prompt_key: str,
 ) -> str:
-    """
+    '''
     Build the replacement Concat() expression using a relative URL so the
-    browser keeps the current host / app / project context:
+    browser keeps the current host / app / project context. The resulting
+    formula (with MSTR's "" double-quote escapes shown literally) is:
 
-        Concat("<a title=""",NAME,""" href=""../{DOC}?prompts={JSON_URL_ENCODED}""
-                target=""_blank"">",NAME,"</a>")
+        Concat("<a title=" QUOTE  NAME  QUOTE " href=" QUOTE
+               "../{DOC}?prompts={JSON_URL_ENCODED}" QUOTE
+               " target=" QUOTE "_blank" QUOTE ">"  NAME  "</a>")
 
     Returns "" if any required input is missing.
-    """
+    '''
     if not all([target_doc_id, display_form, value_form, element_target_attr_id, prompt_key]):
         return ""
 
@@ -271,13 +279,49 @@ def find_doc_prompt_by_source_attr(
 # ── Attribute search / detail fetch ───────────────────────────────────────────
 
 
-def _is_html_expression(expr_obj: dict) -> bool:
-    """True when this form-expression dict represents an HTML/HTML Tag form."""
-    fmt = (expr_obj.get("displayFormat") or expr_obj.get("format") or "").upper()
+def _expression_text(expr_obj: dict) -> str:
+    """
+    Return the MicroStrategy formula text from a form-expression entry.
+
+    The /model/attributes/{id} response shapes the expression as:
+        expressions[i].expression = { "text": "Concat(...)" }
+    Older / future versions may flatten it to a string or nest under "text".
+    """
+    e = expr_obj.get("expression")
+    if isinstance(e, dict):
+        return e.get("text") or ""
+    if isinstance(e, str):
+        return e
+    return expr_obj.get("text") or ""
+
+
+def _set_expression_text(expr_obj: dict, new_text: str) -> None:
+    """Set the formula text on an expression entry, preserving the wrapper shape."""
+    e = expr_obj.get("expression")
+    if isinstance(e, dict):
+        e["text"] = new_text
+        # Drop cached parse so the server re-tokenises from text.
+        e.pop("tree", None)
+        e.pop("tokens", None)
+    else:
+        expr_obj["expression"] = {"text": new_text}
+
+
+def _is_html_form(form_obj: dict) -> bool:
+    """
+    True when the FORM's displayFormat marks it as HTML, or any of its
+    expressions contains HTML markers in the formula text.
+
+    NOTE: `displayFormat` is a property of the form (e.g. "html_tag"),
+    NOT of an individual expression — earlier code looked in the wrong place.
+    """
+    fmt = (form_obj.get("displayFormat") or "").upper()
     if fmt in HTML_DISPLAY_FORMATS:
         return True
-    text = expr_obj.get("expression") or expr_obj.get("text") or ""
-    return bool(HTML_EXPRESSION_MARKERS.search(text))
+    for expr in form_obj.get("expressions") or []:
+        if HTML_EXPRESSION_MARKERS.search(_expression_text(expr)):
+            return True
+    return False
 
 
 def _list_loaded_projects(session: MstrRestSession) -> list[dict]:
@@ -366,61 +410,65 @@ def _process_attribute(
 
     out: list[dict] = []
     for form in defn.get("forms") or []:
+        if not _is_html_form(form):
+            continue
         form_id = form.get("id") or ""
         form_name = form.get("name") or ""
-        for expr_obj in form.get("expressions") or []:
-            if not _is_html_expression(expr_obj):
-                continue
 
-            expr_text = expr_obj.get("expression") or expr_obj.get("text") or ""
-            parsed = parse_html_link_expression(expr_text)
+        # HTML forms typically have one expression; take its text.
+        exprs = form.get("expressions") or []
+        if not exprs:
+            continue
+        expr_text = _expression_text(exprs[0])
+        if not expr_text:
+            continue
 
-            target_doc_id = parsed["target_document_id"]
-            elem_attr_id = parsed["element_target_attribute_id"]
-            value_form = parsed["target_value_id"]
-            display_form = parsed["target_value_name"]
+        parsed = parse_html_link_expression(expr_text)
 
-            prompt_id, prompt_key = "", ""
-            if target_doc_id and elem_attr_id:
-                prompt_id, prompt_key = find_doc_prompt_by_source_attr(
-                    session, project_id, target_doc_id, elem_attr_id,
-                )
+        target_doc_id = parsed["target_document_id"]
+        elem_attr_id = parsed["element_target_attribute_id"]
+        value_form = parsed["target_value_id"]
+        display_form = parsed["target_value_name"]
 
+        prompt_id, prompt_key = "", ""
+        if target_doc_id and elem_attr_id:
+            prompt_id, prompt_key = find_doc_prompt_by_source_attr(
+                session, project_id, target_doc_id, elem_attr_id,
+            )
+
+        new_expr = ""
+        try:
+            new_expr = build_new_form_expression(
+                target_doc_id=target_doc_id,
+                display_form=display_form,
+                value_form=value_form,
+                element_target_attr_id=elem_attr_id,
+                prompt_key=prompt_key,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Could not build NewFormExpression for {aid}/{fid}: {exc}",
+                aid=attr_id, fid=form_id, exc=exc,
+            )
             new_expr = ""
-            try:
-                new_expr = build_new_form_expression(
-                    target_doc_id=target_doc_id,
-                    display_form=display_form,
-                    value_form=value_form,
-                    element_target_attr_id=elem_attr_id,
-                    prompt_key=prompt_key,
-                )
-            except Exception as exc:
-                logger.debug(
-                    "Could not build NewFormExpression for {aid}/{fid}: {exc}",
-                    aid=attr_id, fid=form_id, exc=exc,
-                )
-                new_expr = ""
 
-            out.append({
-                "ProjectID": project_id,
-                "ProjectName": project_name,
-                "AttributeID": attr_id,
-                "AttributeName": attr_name,
-                "AttributeLocation": attr_location,
-                "AttributeFormName": form_name,
-                "AttributeFormID": form_id,
-                "AttributeFormExpression": expr_text,
-                "AttributeFormTargetDocumentID": target_doc_id,
-                "AttributeFormElementTargetAttributeID": elem_attr_id,
-                "AttributeFormTargetValueID": value_form,
-                "AttributeFormTargetValueName": display_form,
-                "AttributeFormTargetDocumentPromptID": prompt_id,
-                "AttributeFormTargetDocumentPromptKey": prompt_key,
-                "NewFormExpression": new_expr,
-            })
-            # Only the first HTML expression per form
-            break
+        out.append({
+            "ProjectID": project_id,
+            "ProjectName": project_name,
+            "AttributeID": attr_id,
+            "AttributeName": attr_name,
+            "AttributeLocation": attr_location,
+            "AttributeFormName": form_name,
+            "AttributeFormID": form_id,
+            "AttributeFormExpression": expr_text,
+            "AttributeFormTargetDocumentID": target_doc_id,
+            "AttributeFormElementTargetAttributeID": elem_attr_id,
+            "AttributeFormTargetValueID": value_form,
+            "AttributeFormTargetValueName": display_form,
+            "AttributeFormTargetDocumentPromptID": prompt_id,
+            "AttributeFormTargetDocumentPromptKey": prompt_key,
+            "NewFormExpression": new_expr,
+        })
     return out
 
 
@@ -588,7 +636,9 @@ def _apply_attribute_form_change(
             return False, f"fetch attribute failed: HTTP {ga.status_code} {ga.text[:200]}"
         body = ga.json()
 
-        # 3. Locate the form, replace expression text on the HTML expression
+        # 3. Locate the form by id; verify it's an HTML form; replace its
+        #    expression text. The expression is nested:
+        #        forms[i].expressions[j].expression.text = "Concat(...)"
         target_form = None
         for f in body.get("forms") or []:
             if (f.get("id") or "").upper() == form_id.upper():
@@ -596,18 +646,15 @@ def _apply_attribute_form_change(
                 break
         if not target_form:
             return False, f"form {form_id} not found on attribute {attribute_id}"
+        if not _is_html_form(target_form):
+            return False, f"form {form_id} is not an HTML/HTML Tag form"
 
-        replaced = False
-        for expr in target_form.get("expressions") or []:
-            if _is_html_expression(expr):
-                expr["expression"] = new_expression
-                # Drop any cached parse; the server will re-tokenise from text.
-                expr.pop("tree", None)
-                expr.pop("tokens", None)
-                replaced = True
-                break
-        if not replaced:
-            return False, f"no HTML expression on form {form_id}"
+        exprs = target_form.get("expressions") or []
+        if not exprs:
+            return False, f"form {form_id} has no expressions"
+
+        # Update the first expression's text (HTML forms have exactly one)
+        _set_expression_text(exprs[0], new_expression)
 
         # 4. PUT updated attribute body
         pa = session._session.put(
