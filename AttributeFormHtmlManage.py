@@ -335,35 +335,58 @@ def _list_attributes(
     project_id: str,
     modified_since_iso: Optional[str],
 ) -> list[dict]:
-    """Page through `/searches/results?type=12` for the project."""
-    attrs: list[dict] = []
-    offset = 0
-    limit = 200
-    while True:
-        params: dict[str, Any] = {
-            "type": OBJECT_TYPE_ATTRIBUTE,
-            "limit": limit,
-            "offset": offset,
-            "includeAncestors": "true",
-            "fields": "id,name,dateModified,ancestors,subtype",
-        }
-        if modified_since_iso:
-            params["modifiedSince"] = modified_since_iso
-        r = _project_request(session, "GET", "/searches/results", project_id, params=params)
-        if not r.ok:
-            logger.error(
-                "Attribute search failed for project {p}: HTTP {s} {b}",
-                p=project_id, s=r.status_code, b=r.text[:200],
-            )
-            r.raise_for_status()
-        data = r.json()
-        page = data.get("result") or []
-        attrs.extend(page)
-        total = int(data.get("totalItems") or len(attrs))
-        offset += limit
-        if not page or len(attrs) >= total:
-            break
-    return attrs
+    """
+    List every attribute (type=12) in the project.
+
+    Uses mstrio-py's `full_search` rather than `GET /searches/results?type=12`.
+    The REST endpoint is unreliable for schema objects across I-Server versions
+    (it silently returns 0 results on many setups for type=12, even though the
+    same call works for type=55 documents/dossiers). `full_search` handles
+    those API differences internally.
+
+    Date filtering is applied in Python after the search, because full_search
+    does not directly expose a `modifiedSince` parameter.
+    """
+    try:
+        from mstrio.object_management import full_search
+    except ImportError as exc:
+        raise ImportError(
+            "mstrio-py is required for full_search. Install: pip install mstrio-py"
+        ) from exc
+
+    conn = session.mstrio_conn
+    logger.debug("full_search(project={p}, object_types=12) ...", p=project_id)
+
+    try:
+        results = full_search(
+            connection=conn,
+            project=project_id,
+            object_types=12,           # ATTRIBUTE
+            to_dictionary=True,
+        ) or []
+    except Exception as exc:
+        logger.error("full_search failed for project {p}: {exc}", p=project_id, exc=exc)
+        raise
+
+    logger.debug(
+        "full_search → {n} attribute(s) (pre-filter)",
+        n=len(results),
+    )
+
+    # Optional date filter (full_search returns dateModified/date_modified — accept both)
+    if modified_since_iso and results:
+        cutoff = modified_since_iso[:10]   # YYYY-MM-DD
+        before = len(results)
+        results = [
+            r for r in results
+            if (r.get("date_modified") or r.get("dateModified") or "")[:10] >= cutoff
+        ]
+        logger.debug(
+            "Date filter (>= {c}): {a} → {b} attribute(s)",
+            c=cutoff, a=before, b=len(results),
+        )
+
+    return results
 
 
 def _fetch_attribute_def(
@@ -400,7 +423,9 @@ def _process_attribute(
     attr_summary: dict,
 ) -> list[dict]:
     """Return a list of CSV-row dicts for every HTML form-expression on the attribute."""
-    attr_id = attr_summary.get("id") or ""
+    # full_search returns native API dicts whose key casing varies across
+    # mstrio-py / I-Server versions — accept both forms.
+    attr_id = (attr_summary.get("id") or attr_summary.get("object_id") or "").strip()
     attr_name = attr_summary.get("name") or ""
     attr_location = object_location(attr_summary.get("ancestors") or [])
 
@@ -605,8 +630,8 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(
             "  No rows were captured. Possible causes:\n"
             "    - Attributes don't have HTML/HTML Tag forms (check via `debug` on a known ID).\n"
-            "    - The /searches/results?type=12 call returned nothing in the project(s) scanned.\n"
-            "    - User lacks read permission on attribute objects.\n"
+            "    - full_search() returned no attributes for this project — verify user has\n"
+            "      read permission on schema objects (attributes are project-scoped).\n"
             "  Re-run with --verbose for full DEBUG logs, or use\n"
             "  `python AttributeFormHtmlManage.py debug <env> --project-id PID --attribute-id AID`\n"
             "  to inspect a single attribute end-to-end."
