@@ -330,23 +330,10 @@ def _list_loaded_projects(session: MstrRestSession) -> list[dict]:
     return r.json() or []
 
 
-def _list_attributes(
-    session: MstrRestSession,
-    project_id: str,
-    modified_since_iso: Optional[str],
+def _list_attributes_via_full_search(
+    session: MstrRestSession, project_id: str,
 ) -> list[dict]:
-    """
-    List every attribute (type=12) in the project.
-
-    Uses mstrio-py's `full_search` rather than `GET /searches/results?type=12`.
-    The REST endpoint is unreliable for schema objects across I-Server versions
-    (it silently returns 0 results on many setups for type=12, even though the
-    same call works for type=55 documents/dossiers). `full_search` handles
-    those API differences internally.
-
-    Date filtering is applied in Python after the search, because full_search
-    does not directly expose a `modifiedSince` parameter.
-    """
+    """Attempt 1 — mstrio-py full_search."""
     try:
         from mstrio.object_management import full_search
     except ImportError as exc:
@@ -355,25 +342,144 @@ def _list_attributes(
         ) from exc
 
     conn = session.mstrio_conn
-    logger.debug("full_search(project={p}, object_types=12) ...", p=project_id)
 
+    # Make sure the mstrio Connection has this project selected — full_search
+    # depends on the connection's active project even when `project=` is passed.
     try:
-        results = full_search(
-            connection=conn,
-            project=project_id,
-            object_types=12,           # ATTRIBUTE
-            to_dictionary=True,
-        ) or []
+        conn.select_project(project_id=project_id)
+        logger.info("select_project({p}) → OK", p=project_id)
     except Exception as exc:
-        logger.error("full_search failed for project {p}: {exc}", p=project_id, exc=exc)
-        raise
+        logger.warning("select_project({p}) failed: {exc}", p=project_id, exc=exc)
 
-    logger.debug(
-        "full_search → {n} attribute(s) (pre-filter)",
-        n=len(results),
-    )
+    logger.info("full_search(project={p}, object_types=12) ...", p=project_id)
+    results = full_search(
+        connection=conn,
+        project=project_id,
+        object_types=12,            # ATTRIBUTE
+        to_dictionary=True,
+        get_ancestors=True,
+    ) or []
+    logger.info("full_search returned {n} attribute(s)", n=len(results))
+    return results
 
-    # Optional date filter (full_search returns dateModified/date_modified — accept both)
+
+def _list_attributes_via_rest(
+    session: MstrRestSession, project_id: str,
+) -> list[dict]:
+    """Attempt 2 — REST POST /api/v2/full-search."""
+    url = session.api_url + "/v2/full-search"
+    headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
+    body = {
+        "projectId": project_id,
+        "objectTypes": [12],
+        "pattern": "*",
+        "domain": 2,
+    }
+    logger.info("REST POST /v2/full-search projectId={p} objectTypes=[12] ...", p=project_id)
+    try:
+        r = session._session.post(url, headers=headers, json=body, timeout=60)
+    except Exception as exc:
+        logger.warning("REST /v2/full-search request failed: {exc}", exc=exc)
+        return []
+    if not r.ok:
+        logger.warning("REST /v2/full-search HTTP {s}: {b}", s=r.status_code, b=r.text[:300])
+        return []
+    try:
+        data = r.json()
+    except Exception:
+        return []
+    results = data if isinstance(data, list) else (data.get("result") or data.get("results") or [])
+    logger.info("REST /v2/full-search returned {n} attribute(s)", n=len(results))
+    return results
+
+
+def _list_attributes_via_searches_results(
+    session: MstrRestSession, project_id: str,
+) -> list[dict]:
+    """
+    Attempt 3 — GET /api/searches/results?type=12 (with explicit searchType
+    + pattern, which is required on some I-Server versions for schema objects).
+    """
+    attrs: list[dict] = []
+    offset = 0
+    limit = 200
+    while True:
+        params = {
+            "type": OBJECT_TYPE_ATTRIBUTE,
+            "limit": limit,
+            "offset": offset,
+            "includeAncestors": "true",
+            "name": "",
+            "searchType": "CONTAINS",
+            "domain": 2,
+            "fields": "id,name,dateModified,ancestors,subtype",
+        }
+        r = _project_request(session, "GET", "/searches/results", project_id, params=params)
+        if not r.ok:
+            logger.warning(
+                "REST /searches/results HTTP {s}: {b}",
+                s=r.status_code, b=r.text[:200],
+            )
+            return attrs
+        data = r.json()
+        page = data.get("result") or []
+        attrs.extend(page)
+        total = int(data.get("totalItems") or len(attrs))
+        offset += limit
+        if not page or len(attrs) >= total:
+            break
+    logger.info("REST /searches/results returned {n} attribute(s)", n=len(attrs))
+    return attrs
+
+
+def _list_attributes(
+    session: MstrRestSession,
+    project_id: str,
+    modified_since_iso: Optional[str],
+) -> list[dict]:
+    """
+    List every attribute (type=12) in the project.
+
+    Tries three approaches in order — uses the first that returns >0 results:
+        1. mstrio-py full_search (canonical, version-managed)
+        2. REST  POST /api/v2/full-search
+        3. REST  GET  /api/searches/results?type=12  with searchType+pattern
+
+    Schema-object search behaviour varies across I-Server versions; this
+    fallback chain makes the export resilient. Logging at INFO level shows
+    which path produced the results, so issues are visible without --verbose.
+
+    Date filter is applied in Python after the search (full_search does not
+    directly expose `modifiedSince`).
+    """
+    results: list[dict] = []
+
+    for attempt_name, fn in (
+        ("full_search", _list_attributes_via_full_search),
+        ("v2/full-search", _list_attributes_via_rest),
+        ("searches/results", _list_attributes_via_searches_results),
+    ):
+        try:
+            results = fn(session, project_id) or []
+        except Exception as exc:
+            logger.warning(
+                "Attempt {a} raised: {exc} — trying next.",
+                a=attempt_name, exc=exc,
+            )
+            results = []
+        if results:
+            logger.info("Using results from attempt: {a}", a=attempt_name)
+            break
+
+    if not results:
+        logger.error(
+            "All three search paths returned 0 attributes for project {p}. "
+            "Verify the user has read permission on schema objects in this project.",
+            p=project_id,
+        )
+        return []
+
+    # Optional date filter
     if modified_since_iso and results:
         cutoff = modified_since_iso[:10]   # YYYY-MM-DD
         before = len(results)
@@ -381,7 +487,7 @@ def _list_attributes(
             r for r in results
             if (r.get("date_modified") or r.get("dateModified") or "")[:10] >= cutoff
         ]
-        logger.debug(
+        logger.info(
             "Date filter (>= {c}): {a} → {b} attribute(s)",
             c=cutoff, a=before, b=len(results),
         )
@@ -1117,5 +1223,77 @@ def main() -> int:
     return args.func(args)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# IDE / PyCharm debugging helpers
+#
+# When you run this file from PyCharm without any CLI parameters (Run / Debug
+# with no arguments configured), the block below injects a default sys.argv
+# so the script runs against a hardcoded test attribute. Set breakpoints in
+# any of these functions to inspect what's happening:
+#
+#     cmd_export                  — top-level export workflow
+#     _list_attributes            — the 3-attempt search fallback chain
+#     _list_attributes_via_full_search       — mstrio-py path
+#     _list_attributes_via_rest              — REST /v2/full-search path
+#     _list_attributes_via_searches_results  — REST /searches/results path
+#     _process_attribute          — per-attribute fetch + form parse
+#     _fetch_attribute_def        — /model/attributes/{id} fetch
+#     find_doc_prompt_by_source_attr  — document-prompts lookup
+#     build_new_form_expression   — Concat() builder
+#
+# To switch test scenarios, comment out the active block in `sys.argv = [...]`
+# below and uncomment a different one. The block is bypassed when CLI args
+# ARE supplied (so normal command-line use is unaffected).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ide_debug_argv() -> list[str]:
+    """Default sys.argv used when running this file from PyCharm with no args."""
+    return [
+        sys.argv[0],
+
+        # ── 1) `debug` walkthrough on a single attribute (RECOMMENDED) ───────
+        #     Fastest signal — bypasses the search entirely, goes straight to
+        #     /model/attributes/{id}, prints every step, optionally writes a CSV.
+        "debug", "qa",
+        "--project-id",   "DB51FDAA428EACA827892C9A301D6012",
+        "--attribute-id", "A60F2B7E4029DF6CFDF4CE8D1915B535",
+        "--output",       "c:/tmp/debug.csv",
+        "--verbose",
+
+        # ── 2) `export` filtered to one attribute (skips project search) ─────
+        # "export", "qa",
+        # "--project",      "DB51FDAA428EACA827892C9A301D6012",
+        # "--attribute-id", "A60F2B7E4029DF6CFDF4CE8D1915B535",
+        # "--verbose",
+
+        # ── 3) full `export` on one project (full search path) ───────────────
+        #     Use this to step through _list_attributes' 3-attempt fallback.
+        # "export", "qa",
+        # "--project",      "DB51FDAA428EACA827892C9A301D6012",
+        # "--verbose",
+
+        # ── 4) `apply`, dry run (reads CSV; does not commit) ─────────────────
+        # "apply", "qa",
+        # "--input", "c:/tmp/attribute_form_html.csv",
+        # "--verbose",
+
+        # ── 5) `apply`, COMMIT (rewrites form expressions — be careful) ──────
+        # "apply", "qa",
+        # "--input", "c:/tmp/attribute_form_html.csv",
+        # "--apply",
+        # "--verbose",
+
+        # ── 6) offline `parse` test (no MSTR connection needed) ──────────────
+        # "parse",
+        # "--text", 'Concat("<a  title=""",ProductName,""" href=...)',
+        # "--prompt-key", "15B83F05424BFB5A0B84848A9F367801@0@10",
+    ]
+
+
 if __name__ == "__main__":
+    # If launched with no CLI args (typical PyCharm Run/Debug), fall into the
+    # IDE debug block above. Otherwise pass through to normal CLI parsing.
+    if len(sys.argv) == 1:
+        sys.argv = _ide_debug_argv()
+        print(f"[IDE-DEBUG] sys.argv = {sys.argv[1:]}")
     sys.exit(main())
