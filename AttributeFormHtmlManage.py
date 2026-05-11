@@ -598,6 +598,19 @@ def cmd_export(args: argparse.Namespace) -> int:
 
         logger.success("Wrote {n} row(s) → {p}", n=len(all_rows), p=output_path)
 
+    # Always print a summary regardless of log level — so the user sees
+    # the outcome even if MSTR_LOG_LEVEL is set to WARNING or higher.
+    print(f"\nExport complete: {len(all_rows)} row(s) → {output_path}")
+    if not all_rows:
+        print(
+            "  No rows were captured. Possible causes:\n"
+            "    - Attributes don't have HTML/HTML Tag forms (check via `debug` on a known ID).\n"
+            "    - The /searches/results?type=12 call returned nothing in the project(s) scanned.\n"
+            "    - User lacks read permission on attribute objects.\n"
+            "  Re-run with --verbose for full DEBUG logs, or use\n"
+            "  `python AttributeFormHtmlManage.py debug <env> --project-id PID --attribute-id AID`\n"
+            "  to inspect a single attribute end-to-end."
+        )
     return 0
 
 
@@ -613,8 +626,10 @@ def cmd_debug(args: argparse.Namespace) -> int:
     """
     Fetch one attribute and walk the entire export pipeline verbosely,
     printing the raw API response, form classification, expression parsing,
-    prompt lookup, and the generated NewFormExpression — without writing
-    a CSV. Use to troubleshoot an individual attribute end-to-end.
+    prompt lookup, and the generated NewFormExpression. After the verbose
+    walkthrough the script also runs `_process_attribute()` — the same
+    function `export` uses — and prints the row(s) that would be written.
+    Pass `--output PATH` to also write those rows to a CSV.
     """
     if args.verbose:
         _enable_verbose()
@@ -753,6 +768,37 @@ def cmd_debug(args: argparse.Namespace) -> int:
                     ] if not val
                 ]
                 print(f"  - Skipped — missing: {missing}")
+
+        # 5. Run the same code path `export` uses and show the rows that
+        #    would be written to CSV. This is the cross-check: if the
+        #    walkthrough above showed valid NewFormExpressions but this
+        #    section returns 0 rows, there's a bug in _process_attribute.
+        print("\n[5/5] Running _process_attribute (same path `export` uses):")
+        attr_summary = {
+            "id": aid,
+            "name": (info.get("name") or ""),
+            "ancestors": [],
+        }
+        rows = _process_attribute(session, pid, "<debug>", attr_summary)
+        print(f"  → returned {len(rows)} row(s)")
+
+        for i, r in enumerate(rows, 1):
+            print(f"\n  -- Row {i} --")
+            for col in COLUMNS:
+                val = r.get(col, "")
+                if isinstance(val, str) and len(val) > 200:
+                    val = val[:200] + f" ... [{len(val)} chars]"
+                print(f"    {col:42} = {val!r}")
+
+        if args.output:
+            output_path = Path(args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, "w", newline="", encoding="utf-8") as fh:
+                w = csv_module.writer(fh, delimiter=";", quoting=csv_module.QUOTE_MINIMAL)
+                w.writerow(COLUMNS)
+                for r in rows:
+                    w.writerow([r.get(c, "") for c in COLUMNS])
+            print(f"\n  Wrote {len(rows)} row(s) → {output_path}")
 
     print("\n==============================================================\n")
     return 0
@@ -1016,6 +1062,9 @@ def parse_args() -> argparse.Namespace:
     pd.add_argument("env", choices=[e.value for e in MstrEnvironment])
     pd.add_argument("--project-id", required=True, help="Project GUID containing the attribute.")
     pd.add_argument("--attribute-id", required=True, help="Attribute GUID to inspect.")
+    pd.add_argument("--output", "-o", type=Path, default=None,
+                    help="Optional CSV path — when set, the row(s) `export` would "
+                         "produce for this attribute are written here too.")
     pd.add_argument("--show-raw", action="store_true",
                     help="Print the full raw /model/attributes/{id} response as JSON.")
     pd.add_argument("--show-doc-prompts", action="store_true",
