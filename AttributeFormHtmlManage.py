@@ -79,7 +79,7 @@ from typing import Any, Optional
 
 from loguru import logger
 
-from mstrio_core import MstrConfig, MstrRestSession, object_location
+from mstrio_core import MstrConfig, MstrRestSession
 from mstrio_core.config import MstrEnvironment
 
 
@@ -114,23 +114,6 @@ COLUMNS = [
 
 DEFAULT_CONCURRENCY = 10
 DEFAULT_OUTPUT_NAME = "attribute_form_html.csv"
-
-
-# --Small helpers --───────────────────────────────────────────────────────────
-
-
-def _project_request(session: MstrRestSession, method: str, path: str, project_id: str, **kwargs):
-    extra = kwargs.pop("headers", {}) or {}
-    headers = {"X-MSTR-ProjectID": project_id, **extra}
-    if method == "GET":
-        return session.get(path, scope="server", headers=headers, **kwargs)
-    if method == "POST":
-        return session.post(path, scope="server", headers=headers, **kwargs)
-    if method == "PUT":
-        return session.put(path, scope="server", headers=headers, **kwargs)
-    if method == "DELETE":
-        return session.delete(path, scope="server", headers=headers, **kwargs)
-    raise ValueError(f"Unsupported method: {method}")
 
 
 # --Expression parsing --──────────────────────────────────────────────────────
@@ -378,6 +361,7 @@ def _list_attributes_via_full_search(
         object_types=12,    # ATTRIBUTE
         domain=2,           # PROJECT domain — schema objects (attributes) live here
         to_dictionary=True,
+        include_hidden=True,
     )
     if modified_since_iso:
         kwargs["begin_modification_time"] = modified_since_iso
@@ -397,148 +381,24 @@ def _list_attributes_via_full_search(
     return results
 
 
-def _list_attributes_via_rest(
-    session: MstrRestSession, project_id: str,
-) -> list[dict]:
-    """Attempt 2 — REST POST /api/v2/full-search."""
-    url = session.api_url + "/v2/full-search"
-    headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
-    body = {
-        "projectId": project_id,
-        "objectTypes": [12],
-        "pattern": "*",
-        "domain": 2,
-    }
-    logger.info("REST POST /v2/full-search projectId={p} objectTypes=[12] ...", p=project_id)
-    try:
-        r = session._session.post(url, headers=headers, json=body, timeout=60)
-    except Exception as exc:
-        logger.warning("REST /v2/full-search request failed: {exc}", exc=exc)
-        return []
-    if not r.ok:
-        logger.warning("REST /v2/full-search HTTP {s}: {b}", s=r.status_code, b=r.text[:300])
-        return []
-    try:
-        data = r.json()
-    except Exception:
-        return []
-    results = data if isinstance(data, list) else (data.get("result") or data.get("results") or [])
-    logger.info("REST /v2/full-search returned {n} attribute(s)", n=len(results))
-    return results
-
-
-def _list_attributes_via_searches_results(
-    session: MstrRestSession, project_id: str,
-) -> list[dict]:
-    """
-    Attempt 3 — GET /api/searches/results?type=12 (with explicit searchType
-    + pattern, which is required on some I-Server versions for schema objects).
-    """
-    attrs: list[dict] = []
-    offset = 0
-    limit = 200
-    while True:
-        params = {
-            "type": OBJECT_TYPE_ATTRIBUTE,
-            "limit": limit,
-            "offset": offset,
-            "includeAncestors": "true",
-            "name": "",
-            "searchType": "CONTAINS",
-            "domain": 2,
-            "fields": "id,name,dateModified,ancestors,subtype",
-        }
-        r = _project_request(session, "GET", "/searches/results", project_id, params=params)
-        if not r.ok:
-            logger.warning(
-                "REST /searches/results HTTP {s}: {b}",
-                s=r.status_code, b=r.text[:200],
-            )
-            return attrs
-        data = r.json()
-        page = data.get("result") or []
-        attrs.extend(page)
-        total = int(data.get("totalItems") or len(attrs))
-        offset += limit
-        if not page or len(attrs) >= total:
-            break
-    logger.info("REST /searches/results returned {n} attribute(s)", n=len(attrs))
-    return attrs
-
-
 def _list_attributes(
     session: MstrRestSession,
     project_id: str,
     modified_since_iso: Optional[str],
 ) -> list[dict]:
     """
-    List every attribute (type=12) in the project.
-
-    Tries three approaches in order — uses the first that returns >0 results:
-        1. mstrio.object_management.search_operations.full_search
-           domain=2 (PROJECT), get_ancestors=True; passes
-           begin_modification_time server-side when --modified-since is set.
-        2. REST  POST /api/v2/full-search
-        3. REST  GET  /api/searches/results?type=12  with searchType+pattern
-
-    Schema-object search behaviour varies across I-Server versions; this
-    fallback chain makes the export resilient. Logging at INFO level shows
-    which path produced the results, so issues are visible without --verbose.
-
-    When attempt 1 is used the date filter is applied server-side.
-    For attempts 2 and 3 a Python-side filter is applied after the search.
+    List every attribute (type=12) in the project using
+    mstrio.object_management.search_operations.full_search with domain=2
+    (PROJECT), get_ancestors=True, and optional begin_modification_time
+    applied server-side when --modified-since is set.
     """
-    results: list[dict] = []
-    succeeded_attempt = ""
-
-    # Attempt 1: search_operations.full_search with domain=2 (PROJECT) and
-    # optional begin_modification_time applied server-side.
-    # Attempts 2 & 3: REST fallbacks (date filter applied in Python afterwards).
-    attempt_fns = [
-        (
-            "search_operations.full_search",
-            lambda s, p: _list_attributes_via_full_search(s, p, modified_since_iso),
-        ),
-        ("v2/full-search", _list_attributes_via_rest),
-        ("searches/results", _list_attributes_via_searches_results),
-    ]
-
-    for attempt_name, fn in attempt_fns:
-        try:
-            results = fn(session, project_id) or []
-        except Exception as exc:
-            logger.warning(
-                "Attempt {a} raised: {exc} — trying next.",
-                a=attempt_name, exc=exc,
-            )
-            results = []
-        if results:
-            logger.info("Using results from attempt: {a}", a=attempt_name)
-            succeeded_attempt = attempt_name
-            break
-
+    results = _list_attributes_via_full_search(session, project_id, modified_since_iso) or []
     if not results:
         logger.error(
-            "All three search paths returned 0 attributes for project {p}. "
+            "search_operations.full_search returned 0 attributes for project {p}. "
             "Verify the user has read permission on schema objects in this project.",
             p=project_id,
         )
-        return []
-
-    # Attempt 1 applies begin_modification_time server-side; only post-filter
-    # for attempts 2 and 3 which don't natively support the date parameter.
-    if modified_since_iso and succeeded_attempt != "search_operations.full_search":
-        cutoff = modified_since_iso[:10]   # YYYY-MM-DD
-        before = len(results)
-        results = [
-            r for r in results
-            if (r.get("date_modified") or r.get("dateModified") or "")[:10] >= cutoff
-        ]
-        logger.info(
-            "Date filter (>= {c}): {a} → {b} attribute(s) [Python-side, attempt={att}]",
-            c=cutoff, a=before, b=len(results), att=succeeded_attempt,
-        )
-
     return results
 
 
@@ -569,6 +429,41 @@ def _fetch_attribute_def(
 # --Export workflow --─────────────────────────────────────────────────────────
 
 
+def _get_attribute_location(
+    session: MstrRestSession, project_id: str, attr_id: str
+) -> str:
+    """
+    Return the folder path for an attribute by instantiating
+    mstrio.modeling.schema.Attribute and reading its .location property.
+
+    Attribute.location returns the full object path including the attribute
+    name as the last segment, e.g.:
+        /ProjectName/Schema Objects/Attributes/ProductName
+    The last segment is stripped so the result is the containing folder:
+        /ProjectName/Schema Objects/Attributes
+
+    Falls back to "" on any error so callers can treat an empty string as
+    "location unavailable" without crashing the export.
+    """
+    try:
+        from mstrio.modeling.schema import Attribute as SchemaAttribute  # type: ignore[import]
+        attr = SchemaAttribute(session.mstrio_conn, id=attr_id)
+        raw = attr.location or ""
+        # Strip the trailing attribute-name segment.
+        location = raw.rstrip("/").rsplit("/", 1)[0] if "/" in raw else raw
+        logger.debug(
+            "Attribute {aid}: location resolved → {loc!r}",
+            aid=attr_id, loc=location,
+        )
+        return location
+    except Exception as exc:
+        logger.debug(
+            "Attribute {aid}: could not resolve location via Attribute.location: {exc}",
+            aid=attr_id, exc=exc,
+        )
+        return ""
+
+
 def _process_attribute(
     session: MstrRestSession,
     project_id: str,
@@ -580,11 +475,10 @@ def _process_attribute(
     # mstrio-py / I-Server versions — accept both forms.
     attr_id = (attr_summary.get("id") or attr_summary.get("object_id") or "").strip()
     attr_name = attr_summary.get("name") or ""
-    attr_location = object_location(attr_summary.get("ancestors") or [])
 
     logger.debug(
-        "Processing attribute id={aid} name={aname!r} location={loc!r}",
-        aid=attr_id, aname=attr_name, loc=attr_location,
+        "Processing attribute id={aid} name={aname!r}",
+        aid=attr_id, aname=attr_name,
     )
 
     defn = _fetch_attribute_def(session, project_id, attr_id)
@@ -595,10 +489,21 @@ def _process_attribute(
     forms = defn.get("forms") or []
     logger.debug("Attribute {aid}: {n} form(s) found in definition.", aid=attr_id, n=len(forms))
 
+    # Location is resolved lazily on the first HTML form match.
+    # Attribute.location makes an SDK call; deferring it avoids the cost for
+    # the majority of attributes that have no HTML forms.
+    _resolved_location: Optional[str] = None
+
     out: list[dict] = []
     for form in forms:
         if not _is_html_form(form):
             continue
+
+        # Resolve location on first HTML-form hit.
+        if _resolved_location is None:
+            _resolved_location = _get_attribute_location(session, project_id, attr_id)
+
+        attr_location = _resolved_location
         form_id = form.get("id") or ""
         form_name = form.get("name") or ""
         form_display_format = form.get("displayFormat") or ""
@@ -1338,15 +1243,14 @@ def main() -> int:
 # so the script runs against a hardcoded test attribute. Set breakpoints in
 # any of these functions to inspect what's happening:
 #
-#     cmd_export                  — top-level export workflow
-#     _list_attributes            — the 3-attempt search fallback chain
-#     _list_attributes_via_full_search       — mstrio-py path
-#     _list_attributes_via_rest              — REST /v2/full-search path
-#     _list_attributes_via_searches_results  — REST /searches/results path
-#     _process_attribute          — per-attribute fetch + form parse
-#     _fetch_attribute_def        — /model/attributes/{id} fetch
+#     cmd_export                      — top-level export workflow
+#     _list_attributes                — delegates to _list_attributes_via_full_search
+#     _list_attributes_via_full_search — search_operations.full_search call
+#     _get_attribute_location         — Attribute.location SDK call + path trim
+#     _process_attribute              — per-attribute fetch + form parse
+#     _fetch_attribute_def            — /model/attributes/{id} fetch
 #     find_doc_prompt_by_source_attr  — document-prompts lookup
-#     build_new_form_expression   — Concat() builder
+#     build_new_form_expression       — Concat() builder
 #
 # To switch test scenarios, comment out the active block in `sys.argv = [...]`
 # below and uncomment a different one. The block is bypassed when CLI args
