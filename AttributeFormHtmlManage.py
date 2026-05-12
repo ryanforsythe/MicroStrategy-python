@@ -280,20 +280,26 @@ def _expression_text(expr_obj: dict) -> str:
 
 def _set_expression_text(expr_obj: dict, new_text: str) -> None:
     """
-    Set the formula text on an expression entry, clearing the cached token
-    and tree representations so the I-Server re-parses from text on changeset
-    commit.
+    Update the formula text on an expression entry, leaving any existing
+    ``tokens`` and ``tree`` intact.
 
-    Used by the schema-changeset PUT workflow: when tokens/tree are absent
-    (keys removed, not set to null) the server re-tokenises from text at
-    commit time. This is only safe inside a schemaEdit=true changeset PUT;
-    the PATCH-based alter_form endpoint requires pre-tokenised expressions.
+    Why keep the old tokens/tree?
+    ──────────────────────────────
+    The PATCH /model/attributes/{id} endpoint (ms-updateAttribute) rejects
+    expression objects that have *neither* tokens nor tree with HTTP 400
+    (error 8004ccde: "The tree or token is required for expression.").
+
+    By preserving the tokens/tree from the GET response we satisfy that
+    validation.  The changeset is opened with ``schemaEdit=true``, so at
+    commit time the I-Server re-tokenises every expression from its ``text``
+    field, replacing the stale tokens with ones that match the new formula.
+    Providing the old tokens is only a syntactic formality — they are not
+    used to infer the new expression semantics.
     """
     e = expr_obj.get("expression")
     if isinstance(e, dict):
         e["text"] = new_text
-        e.pop("tree", None)
-        e.pop("tokens", None)
+        # Intentionally NOT removing tokens/tree — see docstring above.
     else:
         expr_obj["expression"] = {"text": new_text}
 
@@ -1244,8 +1250,9 @@ def _apply_attribute_form_change(
             )
 
         # 3. Find the target form and update its first expression text.
-        #    _set_expression_text() removes tokens/tree so the server
-        #    re-tokenises from the new text at commit time.
+        #    _set_expression_text() updates text but preserves the existing
+        #    tokens/tree (required by the PATCH endpoint); the schemaEdit=true
+        #    changeset commit re-tokenises from the new text.
         target_form = next(
             (f for f in (body.get("forms") or [])
              if (f.get("id") or "").upper() == form_id.upper()),
@@ -1261,10 +1268,22 @@ def _apply_attribute_form_change(
             raise RuntimeError(f"form {form_id} has no expressions")
 
         old_text = _expression_text(exprs[0])
+
+        # Log the first few raw tokens so we can see the server's token
+        # format if we ever need to build them from scratch.
+        old_tokens = (exprs[0].get("expression") or {}).get("tokens") or []
+        logger.debug(
+            "attribute={aid} form={fid}: old expression has {n} token(s); "
+            "first 3: {t}",
+            aid=attribute_id, fid=form_id,
+            n=len(old_tokens),
+            t=old_tokens[:3],
+        )
+
         _set_expression_text(exprs[0], new_expression)
 
         logger.debug(
-            "changeset PUT: attribute={aid} form={fid} "
+            "changeset PATCH: attribute={aid} form={fid} "
             "old_text={old!r} new_text={new!r}",
             aid=attribute_id, fid=form_id,
             old=old_text[:120], new=new_expression[:120],
