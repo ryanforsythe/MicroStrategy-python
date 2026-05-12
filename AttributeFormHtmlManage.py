@@ -378,7 +378,6 @@ def _list_attributes_via_full_search(
         object_types=12,    # ATTRIBUTE
         domain=2,           # PROJECT domain — schema objects (attributes) live here
         to_dictionary=True,
-        get_ancestors=True,
     )
     if modified_since_iso:
         kwargs["begin_modification_time"] = modified_since_iso
