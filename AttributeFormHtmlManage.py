@@ -1164,11 +1164,11 @@ def _apply_attribute_form_change(
     (tokens or tree). We only have the new formula text; constructing a
     correct token array client-side is not feasible.
 
-    The schema-changeset PUT to /model/attributes/{id} defers validation to
-    commit time: clearing the tokens/tree keys (not setting them to null —
-    omitting them entirely) signals the I-Server to re-tokenise from text on
-    commit. This is the only reliable way to submit a text-only expression
-    update for attribute schema objects.
+    The schema-changeset PATCH to /model/attributes/{id} (ms-updateAttribute)
+    defers validation to commit time: clearing the tokens/tree keys (not
+    setting them to null — omitting them entirely) signals the I-Server to
+    re-tokenise from text on commit. This is the only reliable way to submit
+    a text-only expression update for attribute schema objects.
 
     Stale lock handling
     ───────────────────
@@ -1270,15 +1270,18 @@ def _apply_attribute_form_change(
             old=old_text[:120], new=new_expression[:120],
         )
 
-        # 4. PUT the updated attribute body back (same path that GET succeeded).
-        pa = session._session.put(
+        # 4. PATCH the updated attribute body back (same path that GET succeeded).
+        #    MicroStrategy exposes PATCH /model/attributes/{id} (ms-updateAttribute),
+        #    not PUT.  The schemaEdit=true changeset defers tokenisation to commit
+        #    time, so text-only expressions (no tokens/tree keys) are accepted here.
+        pa = session._session.patch(
             attr_url,
             headers={**cs_headers, "Content-Type": "application/json"},
             json=body, timeout=60,
         )
         if not pa.ok:
             raise RuntimeError(
-                f"PUT attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
+                f"PATCH attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
             )
 
         # 5. Commit — the I-Server re-tokenises from text here.
