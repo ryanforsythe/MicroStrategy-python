@@ -1042,26 +1042,30 @@ def _release_schema_edit_lock(
 
     Strategy
     ────────
-    1. If the 400 error response contains an ``existingLock`` with a changeset
-       ID, delete that specific changeset directly.
-    2. Otherwise list all changesets for the project (GET /model/changesets)
-       and delete every one flagged as a schema-edit changeset.
+    1. Parse the changeset ID from the 400 error body's ``existingLock``
+       (checks top-level fields and nested ``lockHolder``).
+    2. Fall back to listing all changesets (tries /v2/model/changesets then
+       /model/changesets) and deleting schema-edit ones.
 
     Returns (released: bool, message: str).
     """
     headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
 
-    # -- Step 1: try to get the specific changeset ID from the error body ------
+    # -- Step 1: extract changeset ID from the error body ----------------------
     if lock_error_body:
         try:
             errors = lock_error_body.get("errors") or []
             extra = (errors[0].get("additionalProperties") or {}) if errors else {}
             existing = extra.get("existingLock") or {}
-            # Field name varies across I-Server versions.
+            lock_holder = existing.get("lockHolder") or {}
+            # Field name varies across I-Server versions; check top-level and
+            # nested lockHolder.
             cs_id = (
                 existing.get("changesetId")
                 or existing.get("id")
                 or existing.get("lockId")
+                or lock_holder.get("changesetId")
+                or lock_holder.get("id")
             )
             if cs_id:
                 dr = session._session.delete(
@@ -1082,15 +1086,31 @@ def _release_schema_edit_lock(
             logger.debug("Could not extract changeset ID from error body: {exc}", exc=exc)
 
     # -- Step 2: list all changesets and delete schema-edit ones ---------------
-    lr = session._session.get(
-        session.api_url + "/model/changesets",
-        headers=headers, timeout=30,
-    )
-    if not lr.ok:
-        return False, f"list changesets failed: HTTP {lr.status_code} {lr.text[:200]}"
+    list_r = None
+    for list_path in ("/v2/model/changesets", "/model/changesets"):
+        r = session._session.get(
+            session.api_url + list_path,
+            headers=headers, timeout=30,
+        )
+        if r.ok:
+            list_r = r
+            break
+        logger.debug(
+            "GET {p} → HTTP {s} (trying next path)", p=list_path, s=r.status_code,
+        )
+
+    if list_r is None:
+        return (
+            False,
+            "Cannot list changesets — both /v2/model/changesets and "
+            "/model/changesets returned errors. "
+            "To unblock schema editing, open MicroStrategy Workstation or "
+            "Developer, navigate to the project's Schema menu and use "
+            "'Unlock Schema' or wait for the lock to time out.",
+        )
 
     try:
-        data = lr.json()
+        data = list_r.json()
     except Exception:
         return False, "list changesets returned non-JSON"
 
@@ -1182,7 +1202,6 @@ def _apply_attribute_form_change(
             ok, msg = _release_schema_edit_lock(session, project_id, err_body)
             logger.info("Lock release result: {msg}", msg=msg)
             if ok:
-                # Retry once after releasing the lock.
                 cs_r = session._session.post(
                     session.api_url + "/model/changesets?schemaEdit=true",
                     headers=headers, timeout=30,
@@ -1195,31 +1214,51 @@ def _apply_attribute_form_change(
 
     cs_headers = {**headers, "X-MSTR-MS-Changeset": changeset_id}
 
+    # Use try/finally so the changeset is ALWAYS rolled back on any failure
+    # path (exception or early return).  We only skip the rollback when we
+    # reach a successful commit.
+    committed = False
     try:
-        # 2. GET the attribute inside the changeset — gives us the full body
-        #    including current expression tokens (which we then drop).
-        ga = session._session.get(
-            session.api_url + f"/model/attributes/{attribute_id}",
-            headers=cs_headers, timeout=30,
-        )
-        if not ga.ok:
-            return False, f"fetch attribute failed: HTTP {ga.status_code} {ga.text[:200]}"
-        body = ga.json()
+        # 2. GET the attribute inside the changeset.
+        #    Probe /v2/ first — some I-Server versions only expose the model
+        #    API under that prefix; fall back to the non-versioned path.
+        attr_url = None
+        body = None
+        for path in (
+            f"/v2/model/attributes/{attribute_id}",
+            f"/model/attributes/{attribute_id}",
+        ):
+            ga = session._session.get(
+                session.api_url + path, headers=cs_headers, timeout=30,
+            )
+            if ga.ok:
+                attr_url = session.api_url + path
+                body = ga.json()
+                break
+            logger.debug("GET {p} → HTTP {s}", p=path, s=ga.status_code)
+
+        if attr_url is None:
+            raise RuntimeError(
+                f"fetch attribute failed: attribute {attribute_id} not found "
+                f"(tried /v2/model/attributes/ and /model/attributes/)"
+            )
 
         # 3. Find the target form and update its first expression text.
         #    _set_expression_text() removes tokens/tree so the server
         #    re-tokenises from the new text at commit time.
         target_form = next(
-            (f for f in body.get("forms") or []
+            (f for f in (body.get("forms") or [])
              if (f.get("id") or "").upper() == form_id.upper()),
             None,
         )
         if not target_form:
-            return False, f"form {form_id} not found on attribute {attribute_id}"
+            raise RuntimeError(
+                f"form {form_id} not found on attribute {attribute_id}"
+            )
 
         exprs = target_form.get("expressions") or []
         if not exprs:
-            return False, f"form {form_id} has no expressions"
+            raise RuntimeError(f"form {form_id} has no expressions")
 
         old_text = _expression_text(exprs[0])
         _set_expression_text(exprs[0], new_expression)
@@ -1231,14 +1270,16 @@ def _apply_attribute_form_change(
             old=old_text[:120], new=new_expression[:120],
         )
 
-        # 4. PUT the updated attribute body back.
+        # 4. PUT the updated attribute body back (same path that GET succeeded).
         pa = session._session.put(
-            session.api_url + f"/model/attributes/{attribute_id}",
+            attr_url,
             headers={**cs_headers, "Content-Type": "application/json"},
             json=body, timeout=60,
         )
         if not pa.ok:
-            return False, f"PUT attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
+            raise RuntimeError(
+                f"PUT attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
+            )
 
         # 5. Commit — the I-Server re-tokenises from text here.
         ca = session._session.post(
@@ -1246,20 +1287,30 @@ def _apply_attribute_form_change(
             headers=headers, timeout=30,
         )
         if not ca.ok:
-            return False, f"commit failed: HTTP {ca.status_code} {ca.text[:200]}"
+            raise RuntimeError(
+                f"commit failed: HTTP {ca.status_code} {ca.text[:200]}"
+            )
 
+        committed = True
         return True, "updated"
 
     except Exception as exc:
-        # Best-effort rollback.
-        try:
-            session._session.delete(
-                session.api_url + f"/model/changesets/{changeset_id}",
-                headers=headers, timeout=30,
-            )
-        except Exception:
-            pass
-        return False, f"error: {exc}"
+        return False, str(exc)
+
+    finally:
+        # Roll back the changeset if we never committed (covers every failure
+        # path — exceptions, RuntimeError raises, and any future early returns).
+        if not committed:
+            try:
+                session._session.delete(
+                    session.api_url + f"/model/changesets/{changeset_id}",
+                    headers=headers, timeout=30,
+                )
+                logger.debug(
+                    "Rolled back changeset {id} after failure.", id=changeset_id,
+                )
+            except Exception:
+                pass
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
