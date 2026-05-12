@@ -278,17 +278,6 @@ def _expression_text(expr_obj: dict) -> str:
     return expr_obj.get("text") or ""
 
 
-def _set_expression_text(expr_obj: dict, new_text: str) -> None:
-    """Set the formula text on an expression entry, preserving the wrapper shape."""
-    e = expr_obj.get("expression")
-    if isinstance(e, dict):
-        e["text"] = new_text
-        # Drop cached parse so the server re-tokenises from text.
-        e.pop("tree", None)
-        e.pop("tokens", None)
-    else:
-        expr_obj["expression"] = {"text": new_text}
-
 
 def _is_html_form(form_obj: dict) -> bool:
     """
@@ -1028,85 +1017,69 @@ def _apply_attribute_form_change(
     do_apply: bool,
 ) -> tuple[bool, str]:
     """
-    Open a schema-edit changeset, fetch the attribute, replace the HTML
-    form's expression text with `new_expression`, PUT back, commit.
+    Use mstrio.modeling.schema.Attribute.alter_form() to replace the HTML
+    form expression text. The SDK manages schema-changeset creation and commit
+    internally — no manual changeset handling is required.
     """
     if not do_apply:
         return True, "DRY-RUN — would update form expression"
 
-    headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
+    try:
+        from mstrio.modeling.schema import Attribute as SchemaAttribute  # type: ignore[import]
+    except ImportError as exc:
+        return False, f"mstrio.modeling.schema not available: {exc}"
 
-    # 1. Open schema changeset
-    cs_r = session._session.post(
-        session.api_url + "/model/changesets?schemaEdit=true",
-        headers=headers, timeout=30,
+    conn = session.mstrio_conn
+
+    # Select the project so SDK schema calls are scoped correctly.
+    try:
+        conn.select_project(project_id=project_id)
+    except Exception as exc:
+        return False, f"select_project({project_id}) failed: {exc}"
+
+    # Instantiate the attribute — fetches the current forms and expressions.
+    try:
+        attr = SchemaAttribute(conn, id=attribute_id)
+    except Exception as exc:
+        return False, f"could not fetch attribute {attribute_id}: {exc}"
+
+    # Locate the target form by ID.
+    target_form = next(
+        (f for f in (attr.forms or []) if (f.id or "").upper() == form_id.upper()),
+        None,
     )
-    if not cs_r.ok:
-        return False, f"open changeset failed: HTTP {cs_r.status_code} {cs_r.text[:200]}"
-    changeset_id = cs_r.json().get("id")
-    if not changeset_id:
-        return False, "open changeset returned no id"
+    if target_form is None:
+        return False, f"form {form_id} not found on attribute {attribute_id}"
 
-    cs_headers = {**headers, "X-MSTR-MS-Changeset": changeset_id}
+    exprs = list(target_form.expressions or [])
+    if not exprs:
+        return False, f"form {form_id} has no expressions"
+
+    # Update the first expression's formula text in-place.
+    # Clear cached tokens/tree so the I-Server re-parses from the new text.
+    expr_node = exprs[0].expression
+    if expr_node is None:
+        return False, f"form {form_id}: expression node is None"
+
+    old_text = (getattr(expr_node, "text", None) or "")
+    expr_node.text = new_expression
+    for field in ("tokens", "tree"):
+        if hasattr(expr_node, field):
+            setattr(expr_node, field, None)
+
+    logger.debug(
+        "alter_form: attribute={aid} form={fid} "
+        "old_text={old!r} new_text={new!r}",
+        aid=attribute_id, fid=form_id,
+        old=old_text[:120], new=new_expression[:120],
+    )
 
     try:
-        # 2. Fetch attribute inside the changeset
-        ga = session._session.get(
-            session.api_url + f"/model/attributes/{attribute_id}",
-            headers=cs_headers, timeout=30,
-        )
-        if not ga.ok:
-            return False, f"fetch attribute failed: HTTP {ga.status_code} {ga.text[:200]}"
-        body = ga.json()
-
-        # 3. Locate the form by id; verify it's an HTML form; replace its
-        #    expression text. The expression is nested:
-        #        forms[i].expressions[j].expression.text = "Concat(...)"
-        target_form = None
-        for f in body.get("forms") or []:
-            if (f.get("id") or "").upper() == form_id.upper():
-                target_form = f
-                break
-        if not target_form:
-            return False, f"form {form_id} not found on attribute {attribute_id}"
-        if not _is_html_form(target_form):
-            return False, f"form {form_id} is not an HTML/HTML Tag form"
-
-        exprs = target_form.get("expressions") or []
-        if not exprs:
-            return False, f"form {form_id} has no expressions"
-
-        # Update the first expression's text (HTML forms have exactly one)
-        _set_expression_text(exprs[0], new_expression)
-
-        # 4. PUT updated attribute body
-        pa = session._session.put(
-            session.api_url + f"/model/attributes/{attribute_id}",
-            headers={**cs_headers, "Content-Type": "application/json"},
-            json=body, timeout=60,
-        )
-        if not pa.ok:
-            return False, f"PUT attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
-
-        # 5. Commit
-        ca = session._session.post(
-            session.api_url + f"/model/changesets/{changeset_id}/commit",
-            headers=headers, timeout=30,
-        )
-        if not ca.ok:
-            return False, f"commit failed: HTTP {ca.status_code} {ca.text[:200]}"
-
-        return True, "updated"
+        attr.alter_form(form_id=form_id, expressions=exprs)
     except Exception as exc:
-        # Try to roll back the changeset
-        try:
-            session._session.delete(
-                session.api_url + f"/model/changesets/{changeset_id}",
-                headers=headers, timeout=30,
-            )
-        except Exception:
-            pass
-        return False, f"error: {exc}"
+        return False, f"alter_form failed: {exc}"
+
+    return True, "updated"
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
