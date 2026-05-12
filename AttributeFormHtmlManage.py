@@ -331,15 +331,36 @@ def _list_loaded_projects(session: MstrRestSession) -> list[dict]:
 
 
 def _list_attributes_via_full_search(
-    session: MstrRestSession, project_id: str,
+    session: MstrRestSession,
+    project_id: str,
+    modified_since_iso: Optional[str] = None,
 ) -> list[dict]:
-    """Attempt 1 — mstrio-py full_search."""
+    """Attempt 1 — mstrio.object_management.search_operations.full_search.
+
+    Uses `search_operations.full_search` (not the top-level `full_search`)
+    because this deeper import exposes `begin_modification_time` /
+    `end_modification_time` parameters and properly handles schema-object
+    domains — attributes (type=12) are project-scoped schema objects that
+    require `domain=2` (PROJECT) to be enumerated.
+
+    Falls back to the top-level `mstrio.object_management.full_search` when
+    the search_operations sub-module is not present (older mstrio-py builds).
+    """
+    # Prefer the deeper import that carries native date-range support.
+    full_search = None
     try:
-        from mstrio.object_management import full_search
-    except ImportError as exc:
-        raise ImportError(
-            "mstrio-py is required for full_search. Install: pip install mstrio-py"
-        ) from exc
+        from mstrio.object_management.search_operations import full_search  # type: ignore[assignment]
+        logger.debug("Using mstrio.object_management.search_operations.full_search")
+    except ImportError:
+        pass
+    if full_search is None:
+        try:
+            from mstrio.object_management import full_search  # type: ignore[assignment]
+            logger.debug("Using mstrio.object_management.full_search (fallback)")
+        except ImportError as exc:
+            raise ImportError(
+                "mstrio-py is required for full_search. Install: pip install mstrio-py"
+            ) from exc
 
     conn = session.mstrio_conn
 
@@ -351,15 +372,29 @@ def _list_attributes_via_full_search(
     except Exception as exc:
         logger.warning("select_project({p}) failed: {exc}", p=project_id, exc=exc)
 
-    logger.info("full_search(project={p}, object_types=12) ...", p=project_id)
-    results = full_search(
+    kwargs: dict = dict(
         connection=conn,
         project=project_id,
-        object_types=12,            # ATTRIBUTE
+        object_types=12,    # ATTRIBUTE
+        domain=2,           # PROJECT domain — schema objects (attributes) live here
         to_dictionary=True,
         get_ancestors=True,
-    ) or []
-    logger.info("full_search returned {n} attribute(s)", n=len(results))
+    )
+    if modified_since_iso:
+        kwargs["begin_modification_time"] = modified_since_iso
+        logger.info(
+            "search_operations.full_search(project={p}, object_types=12, "
+            "begin_modification_time={ts}) ...",
+            p=project_id, ts=modified_since_iso,
+        )
+    else:
+        logger.info(
+            "search_operations.full_search(project={p}, object_types=12, domain=2) ...",
+            p=project_id,
+        )
+
+    results = full_search(**kwargs) or []
+    logger.info("search_operations.full_search returned {n} attribute(s)", n=len(results))
     return results
 
 
@@ -441,7 +476,9 @@ def _list_attributes(
     List every attribute (type=12) in the project.
 
     Tries three approaches in order — uses the first that returns >0 results:
-        1. mstrio-py full_search (canonical, version-managed)
+        1. mstrio.object_management.search_operations.full_search
+           domain=2 (PROJECT), get_ancestors=True; passes
+           begin_modification_time server-side when --modified-since is set.
         2. REST  POST /api/v2/full-search
         3. REST  GET  /api/searches/results?type=12  with searchType+pattern
 
@@ -449,16 +486,25 @@ def _list_attributes(
     fallback chain makes the export resilient. Logging at INFO level shows
     which path produced the results, so issues are visible without --verbose.
 
-    Date filter is applied in Python after the search (full_search does not
-    directly expose `modifiedSince`).
+    When attempt 1 is used the date filter is applied server-side.
+    For attempts 2 and 3 a Python-side filter is applied after the search.
     """
     results: list[dict] = []
+    succeeded_attempt = ""
 
-    for attempt_name, fn in (
-        ("full_search", _list_attributes_via_full_search),
+    # Attempt 1: search_operations.full_search with domain=2 (PROJECT) and
+    # optional begin_modification_time applied server-side.
+    # Attempts 2 & 3: REST fallbacks (date filter applied in Python afterwards).
+    attempt_fns = [
+        (
+            "search_operations.full_search",
+            lambda s, p: _list_attributes_via_full_search(s, p, modified_since_iso),
+        ),
         ("v2/full-search", _list_attributes_via_rest),
         ("searches/results", _list_attributes_via_searches_results),
-    ):
+    ]
+
+    for attempt_name, fn in attempt_fns:
         try:
             results = fn(session, project_id) or []
         except Exception as exc:
@@ -469,6 +515,7 @@ def _list_attributes(
             results = []
         if results:
             logger.info("Using results from attempt: {a}", a=attempt_name)
+            succeeded_attempt = attempt_name
             break
 
     if not results:
@@ -479,8 +526,9 @@ def _list_attributes(
         )
         return []
 
-    # Optional date filter
-    if modified_since_iso and results:
+    # Attempt 1 applies begin_modification_time server-side; only post-filter
+    # for attempts 2 and 3 which don't natively support the date parameter.
+    if modified_since_iso and succeeded_attempt != "search_operations.full_search":
         cutoff = modified_since_iso[:10]   # YYYY-MM-DD
         before = len(results)
         results = [
@@ -488,8 +536,8 @@ def _list_attributes(
             if (r.get("date_modified") or r.get("dateModified") or "")[:10] >= cutoff
         ]
         logger.info(
-            "Date filter (>= {c}): {a} → {b} attribute(s)",
-            c=cutoff, a=before, b=len(results),
+            "Date filter (>= {c}): {a} → {b} attribute(s) [Python-side, attempt={att}]",
+            c=cutoff, a=before, b=len(results), att=succeeded_attempt,
         )
 
     return results
@@ -535,23 +583,47 @@ def _process_attribute(
     attr_name = attr_summary.get("name") or ""
     attr_location = object_location(attr_summary.get("ancestors") or [])
 
+    logger.debug(
+        "Processing attribute id={aid} name={aname!r} location={loc!r}",
+        aid=attr_id, aname=attr_name, loc=attr_location,
+    )
+
     defn = _fetch_attribute_def(session, project_id, attr_id)
     if not defn:
+        logger.debug("Attribute {aid}: definition fetch returned nothing — skipping.", aid=attr_id)
         return []
 
+    forms = defn.get("forms") or []
+    logger.debug("Attribute {aid}: {n} form(s) found in definition.", aid=attr_id, n=len(forms))
+
     out: list[dict] = []
-    for form in defn.get("forms") or []:
+    for form in forms:
         if not _is_html_form(form):
             continue
         form_id = form.get("id") or ""
         form_name = form.get("name") or ""
+        form_display_format = form.get("displayFormat") or ""
+
+        logger.debug(
+            "Attribute {aid}: HTML form matched — name={fname!r} id={fid} "
+            "displayFormat={fmt!r}",
+            aid=attr_id, fname=form_name, fid=form_id, fmt=form_display_format,
+        )
 
         # HTML forms typically have one expression; take its text.
         exprs = form.get("expressions") or []
         if not exprs:
+            logger.debug(
+                "Attribute {aid} form {fid}: no expressions array — skipping.",
+                aid=attr_id, fid=form_id,
+            )
             continue
         expr_text = _expression_text(exprs[0])
         if not expr_text:
+            logger.debug(
+                "Attribute {aid} form {fid}: expression text is empty — skipping.",
+                aid=attr_id, fid=form_id,
+            )
             continue
 
         parsed = parse_html_link_expression(expr_text)
@@ -583,7 +655,29 @@ def _process_attribute(
             )
             new_expr = ""
 
-        out.append({
+        if new_expr:
+            logger.debug(
+                "Attribute {aid} form {fid}: NewFormExpression built successfully "
+                "({n} chars).",
+                aid=attr_id, fid=form_id, n=len(new_expr),
+            )
+        else:
+            missing = [
+                name for name, val in [
+                    ("target_doc_id", target_doc_id),
+                    ("display_form", display_form),
+                    ("value_form", value_form),
+                    ("element_target_attr_id", elem_attr_id),
+                    ("prompt_key", prompt_key),
+                ] if not val
+            ]
+            logger.debug(
+                "Attribute {aid} form {fid}: NewFormExpression is blank — "
+                "missing fields: {missing}",
+                aid=attr_id, fid=form_id, missing=missing,
+            )
+
+        row = {
             "ProjectID": project_id,
             "ProjectName": project_name,
             "AttributeID": attr_id,
@@ -599,7 +693,21 @@ def _process_attribute(
             "AttributeFormTargetDocumentPromptID": prompt_id,
             "AttributeFormTargetDocumentPromptKey": prompt_key,
             "NewFormExpression": new_expr,
-        })
+        }
+        logger.debug(
+            "Attribute {aid} form {fid}: appending row — "
+            "targetDoc={doc} promptKey={key!r} newExpr={has_expr}",
+            aid=attr_id, fid=form_id,
+            doc=target_doc_id or "(none)",
+            key=prompt_key or "",
+            has_expr=bool(new_expr),
+        )
+        out.append(row)
+
+    logger.debug(
+        "Attribute {aid}: _process_attribute returning {n} row(s).",
+        aid=attr_id, n=len(out),
+    )
     return out
 
 
