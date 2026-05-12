@@ -1027,6 +1027,105 @@ def _read_csv_rows(path: Path) -> list[dict]:
     return rows
 
 
+# Error code returned by the I-Server when an exclusive schema-edit lock
+# is already held by another session / orphaned changeset.
+_SCHEMA_LOCK_ERROR_CODE = "8004cc41"
+
+
+def _release_schema_edit_lock(
+    session: MstrRestSession,
+    project_id: str,
+    lock_error_body: Optional[dict] = None,
+) -> tuple[bool, str]:
+    """
+    Release a stale schema-edit lock by deleting the changeset(s) that hold it.
+
+    Strategy
+    ────────
+    1. If the 400 error response contains an ``existingLock`` with a changeset
+       ID, delete that specific changeset directly.
+    2. Otherwise list all changesets for the project (GET /model/changesets)
+       and delete every one flagged as a schema-edit changeset.
+
+    Returns (released: bool, message: str).
+    """
+    headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
+
+    # -- Step 1: try to get the specific changeset ID from the error body ------
+    if lock_error_body:
+        try:
+            errors = lock_error_body.get("errors") or []
+            extra = (errors[0].get("additionalProperties") or {}) if errors else {}
+            existing = extra.get("existingLock") or {}
+            # Field name varies across I-Server versions.
+            cs_id = (
+                existing.get("changesetId")
+                or existing.get("id")
+                or existing.get("lockId")
+            )
+            if cs_id:
+                dr = session._session.delete(
+                    session.api_url + f"/model/changesets/{cs_id}",
+                    headers=headers, timeout=30,
+                )
+                if dr.ok:
+                    logger.info(
+                        "Released stale schema-edit changeset {id} (from error body).",
+                        id=cs_id,
+                    )
+                    return True, f"released changeset {cs_id}"
+                logger.warning(
+                    "DELETE changeset {id} HTTP {s} — falling back to list.",
+                    id=cs_id, s=dr.status_code,
+                )
+        except Exception as exc:
+            logger.debug("Could not extract changeset ID from error body: {exc}", exc=exc)
+
+    # -- Step 2: list all changesets and delete schema-edit ones ---------------
+    lr = session._session.get(
+        session.api_url + "/model/changesets",
+        headers=headers, timeout=30,
+    )
+    if not lr.ok:
+        return False, f"list changesets failed: HTTP {lr.status_code} {lr.text[:200]}"
+
+    try:
+        data = lr.json()
+    except Exception:
+        return False, "list changesets returned non-JSON"
+
+    all_cs = data if isinstance(data, list) else (data.get("changesets") or [])
+    schema_cs = [
+        cs for cs in all_cs
+        if cs.get("schemaEdit") is True or cs.get("type") in ("schema_edit", "SCHEMA_EDIT")
+    ]
+
+    if not schema_cs:
+        return False, "no schema-edit changesets found to release"
+
+    released = 0
+    for cs in schema_cs:
+        cs_id = cs.get("id")
+        if not cs_id:
+            continue
+        dr = session._session.delete(
+            session.api_url + f"/model/changesets/{cs_id}",
+            headers=headers, timeout=30,
+        )
+        if dr.ok:
+            released += 1
+            logger.info("Released stale schema-edit changeset {id}.", id=cs_id)
+        else:
+            logger.warning(
+                "Could not release changeset {id}: HTTP {s} {b}",
+                id=cs_id, s=dr.status_code, b=dr.text[:200],
+            )
+
+    if released:
+        return True, f"released {released} of {len(schema_cs)} schema-edit changeset(s)"
+    return False, f"found {len(schema_cs)} schema-edit changeset(s) but could not release any"
+
+
 def _apply_attribute_form_change(
     session: MstrRestSession,
     project_id: str,
@@ -1050,6 +1149,13 @@ def _apply_attribute_form_change(
     omitting them entirely) signals the I-Server to re-tokenise from text on
     commit. This is the only reliable way to submit a text-only expression
     update for attribute schema objects.
+
+    Stale lock handling
+    ───────────────────
+    If another session left a schema-edit changeset open, opening a new one
+    returns HTTP 400 / error 8004cc41. This function detects that, calls
+    _release_schema_edit_lock() to clean up the orphaned changeset, then
+    retries once.
     """
     if not do_apply:
         return True, "DRY-RUN — would update form expression"
@@ -1057,10 +1163,30 @@ def _apply_attribute_form_change(
     headers = {**session.server_headers, "X-MSTR-ProjectID": project_id}
 
     # 1. Open a schema-edit changeset.
+    #    On HTTP 400 / schema-lock error, release the stale lock and retry once.
     cs_r = session._session.post(
         session.api_url + "/model/changesets?schemaEdit=true",
         headers=headers, timeout=30,
     )
+    if not cs_r.ok and cs_r.status_code == 400:
+        try:
+            err_body = cs_r.json()
+        except Exception:
+            err_body = {}
+        err_code = ((err_body.get("errors") or [{}])[0]).get("code", "")
+        if err_code == _SCHEMA_LOCK_ERROR_CODE:
+            logger.warning(
+                "Schema-edit lock is held by another session — "
+                "attempting to release stale changeset...",
+            )
+            ok, msg = _release_schema_edit_lock(session, project_id, err_body)
+            logger.info("Lock release result: {msg}", msg=msg)
+            if ok:
+                # Retry once after releasing the lock.
+                cs_r = session._session.post(
+                    session.api_url + "/model/changesets?schemaEdit=true",
+                    headers=headers, timeout=30,
+                )
     if not cs_r.ok:
         return False, f"open changeset failed: HTTP {cs_r.status_code} {cs_r.text[:200]}"
     changeset_id = cs_r.json().get("id")
