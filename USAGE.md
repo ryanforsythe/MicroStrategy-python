@@ -28,6 +28,7 @@ extraction, and content-group operations.
    - [UserGroupMemberManage.py](#usergroupmembermanagepy)
    - [SystemManager_ClearCache.py](#systemmanager_clearcachepy)
    - [ExecuteObjects.py](#executeobjectspy)
+   - [AttributeFormHtmlManage.py](#attributeformhtmlmanagepy)
    - [DatabaseInstances.py](#databaseinstancespy)
    - [DatabaseInstanceVLDB.py](#databaseinstancevldbpy)
    - [ReportVLDBCompare.py](#reportvldbcomparepy)
@@ -1346,17 +1347,35 @@ parallel and updates the same CSV with execution status as work progresses.
 | 3 | 768/769/770/771/774 | `Report` | `/v2/reports/{id}/instances` |
 | 3 | 776 | `Cube` | `OlapCube.publish()` (REST fallback `/cubes/{id}/instances`) |
 | 55 | 14080 | `Document` | `/v2/documents/{id}/instances` |
-| 55 | 14081 | `Dossier` | `/v2/documents/{id}/instances` |
+| 55 | 14081 | `Dossier` | `/v2/dossiers/{id}/instances` (NOT `/documents/`) |
+
+> **Why dossiers use a different path:** even though Dossiers and Documents
+> share metadata type 55, the REST API exposes them under distinct path
+> roots (`/dossiers/` vs `/documents/`). Calling `/v2/documents/{id}/instances`
+> on a dossier returns HTTP 404. The script picks the right path based on
+> the resolved subtype.
 
 #### Prompt handling rules
 
-- **User-supplied answers** in `prompt_answers_json` are used verbatim.
-- **Unanswered prompts** receive defaults via `closeAllPrompts: true` —
-  prompts with defaults will fall back to those.
-- **Optional prompts** without defaults are not answered (skipped).
-- **Required prompts** with no default and no user answer cause the
-  execution to error — the underlying I-Server returns a prompt-required
-  failure which the worker captures in `status_details`.
+For each prompt on the object, the worker emits one entry in the answer
+payload — never empty when prompts exist (the API rejects an empty
+`prompts` list with `ERR006`):
+
+| Condition | Payload entry |
+|---|---|
+| User supplied answers via `prompt_answers_json` (matched by `key` or `id`) | `{"type":..., "key":..., "answers":[...]}` (verbatim) |
+| No user answers | `{"type":..., "key":..., "useDefault":true}` |
+
+`useDefault: true` lets the I-Server apply whatever default is configured:
+
+- **Default present** → that default is used.
+- **Optional prompt, no default** → answered empty (no filter applied).
+- **Required prompt, no default** → I-Server returns an error which becomes
+  the row's `status_details`.
+
+**Prompt-list fetch:** the v2 prompts endpoint (`/api/v2/.../prompts`) is
+not present on every I-Server version. The script tries v2 first and falls
+back to v1 (`/api/.../prompts?closed=false`) on a 404.
 
 #### CSV schema
 
@@ -1447,6 +1466,282 @@ python ExecuteObjects.py prod -i objects.csv -o /tmp/run1.csv -c 25 --timeout 30
 
 **Sample input** (`execute_objects_sample.csv`): 3 objects, mixed prompt
 states — minimal columns plus a row with pre-filled answers.
+
+---
+
+### AttributeFormHtmlManage.py
+
+Find and migrate `HTML` / `HTML Tag` AttributeForm expressions from the
+legacy `?evt=3140&documentID=...` URL pattern to the modern
+`?prompts=[[{...}]]` JSON URL pattern. Designed as a two-pass workflow
+through a single CSV file.
+
+#### Workflow
+
+1. **`export`** — Scan every loaded project (or a specific subset via
+   `--project GUID ...`) for Attributes whose Forms contain an HTML /
+   HTML Tag expression. For each match the script parses the existing
+   hyperlink, looks up the corresponding prompt on the target document,
+   and writes a suggested `NewFormExpression` column.
+2. **(manual review)** — Open the CSV, blank out any `NewFormExpression`
+   you don't want applied; the rest are ready to go.
+3. **`apply`** — Re-read the same CSV. For every row whose
+   `NewFormExpression` is populated, replace the form expression text on
+   the I-Server via a model changeset. Dry-run by default; pass `--apply`
+   to commit.
+
+#### What gets parsed out of a legacy expression
+
+Given a legacy expression like (`""` is MicroStrategy formula escape for `"`):
+
+```
+Concat("<a  title=""",ProductName,""" href=","""","?evt=3140&...
+       &documentID=F7069A9C40775A6EB927FA9173795272
+       &elementsPromptAnswers=A60F2B7E4029DF6CFDF4CE8D1915B535;
+       A60F2B7E4029DF6CFDF4CE8D1915B535:",ToString(ProductID),"&evtwait=true&share=1"...)
+```
+
+the script extracts:
+
+| Field | Source |
+|---|---|
+| `AttributeFormTargetDocumentID` | The `documentID=...` parameter |
+| `AttributeFormElementTargetAttributeID` | First GUID in `elementsPromptAnswers=` |
+| `AttributeFormTargetValueID` | Identifier inside `ToString(...)` (or bare identifier) |
+| `AttributeFormTargetValueName` | The identifier after `title=""",` |
+
+Then for the prompt lookup:
+
+```
+GET /api/v2/documents/{TargetDocID}/prompts    (fallback /api/documents/.../prompts?closed=false)
+```
+
+Iterates the returned prompts and picks the one whose
+`source.id == AttributeFormElementTargetAttributeID` →
+`AttributeFormTargetDocumentPromptID`, `AttributeFormTargetDocumentPromptKey`.
+
+#### Generated NewFormExpression
+
+```
+Concat("<a title=""",ProductName,
+       """ href=""../<TargetDocID>?prompts=<URL_ENCODED_JSON_PREFIX>",
+       ToString(ProductID),
+       "<URL_ENCODED_JSON_SUFFIX>"" target=""_blank"">",
+       ProductName,
+       "</a>")
+```
+
+Where the JSON skeleton (URL-encoded into the formula) is:
+
+```
+[[{"key":"<PROMPT_KEY>","values":["<ELEM_ATTR_ID>:<VALUE>"],"useDefault":false}]]
+```
+
+The URL is **relative** (`../<docID>?prompts=...`) so the browser keeps
+the current host/app/project context — no environment-specific values in
+the formula.
+
+If any required input is missing (target doc, element-target attribute,
+value form, display form, prompt key) the script leaves `NewFormExpression`
+blank, and `apply` skips that row.
+
+#### HTML form detection
+
+A form expression is treated as HTML when **either**:
+
+- its `displayFormat` is one of `HTML_TAG`, `HTML`, `URL`; **or**
+- the expression text matches `<a `, `<img `, `<iframe`, or `href=`.
+
+#### CSV schema
+
+| Column | Filled by | Notes |
+|---|---|---|
+| `ProjectID` / `ProjectName` | export | |
+| `AttributeID` / `AttributeName` / `AttributeLocation` | export | Folder path from `ancestors` |
+| `AttributeFormName` / `AttributeFormID` | export | |
+| `AttributeFormExpression` | export | Original expression text |
+| `AttributeFormTargetDocumentID` | export | Parsed `documentID=` |
+| `AttributeFormElementTargetAttributeID` | export | Parsed `elementsPromptAnswers=` |
+| `AttributeFormTargetValueID` | export | e.g. `ProductID` |
+| `AttributeFormTargetValueName` | export | e.g. `ProductName` |
+| `AttributeFormTargetDocumentPromptID` | export | From `/documents/{id}/prompts` |
+| `AttributeFormTargetDocumentPromptKey` | export | Same lookup |
+| `NewFormExpression` | export (suggestion) → user edits → `apply` consumes | Empty cell = skip on apply |
+
+Column matching on read is case-insensitive, so you can capitalize/format
+the headers however you like in Excel without breaking `apply`.
+
+#### Apply mechanics
+
+For every row with a non-empty `NewFormExpression`, `apply`:
+
+1. Opens a schema changeset: `POST /api/model/changesets?schemaEdit=true`
+2. Fetches the attribute inside the changeset: `GET /api/model/attributes/{id}`
+3. Locates the form by `id`, replaces the HTML expression's `expression`
+   text, and drops any cached `tree`/`tokens` (the server re-tokenises)
+4. PUTs the modified body back
+5. Commits the changeset
+6. On any error, deletes (rolls back) the changeset
+
+#### Usage
+
+```
+python AttributeFormHtmlManage.py export <env> [options]
+python AttributeFormHtmlManage.py apply  <env> --input PATH [--apply]
+python AttributeFormHtmlManage.py debug  <env> --project-id PID --attribute-id AID [options]
+python AttributeFormHtmlManage.py parse  --text "Concat(...)"   [--prompt-key KEY]
+```
+
+| `export` argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--output PATH`, `-o` | No | Output CSV (default: `<output_dir>/attribute_form_html.csv`) |
+| `--project GUID ...` | No | Limit to specific project GUIDs |
+| `--attribute-id GUID ...` | No | Skip the project search and fetch only these attribute GUIDs |
+| `--modified-since YYYY-MM-DD` | No | Only attributes modified on/after this date |
+| `--concurrency N`, `-c` | No | Parallel attribute fetches per project (default: 10) |
+| `--verbose`, `-v` | No | Enable DEBUG-level stderr logging |
+
+| `apply` argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--input PATH`, `-i` | Yes | CSV produced by `export` (with `NewFormExpression` populated) |
+| `--apply` | No | Commit changes (default: dry-run, logs what would happen) |
+| `--verbose`, `-v` | No | Enable DEBUG-level stderr logging |
+
+| `debug` argument | Required | Description |
+|---|---|---|
+| `env` | Yes | Environment: `dev`, `qa`, or `prod` |
+| `--project-id PID` | Yes | Project GUID containing the attribute |
+| `--attribute-id AID` | Yes | Attribute GUID to inspect |
+| `--output PATH`, `-o` | No | Optional CSV path — when set, the row(s) `export` would produce for this attribute are written here too |
+| `--show-raw` | No | Dump the full `/model/attributes/{id}` JSON |
+| `--show-doc-prompts` | No | Dump the full prompts list of the target document |
+| `--verbose`, `-v` | No | Enable DEBUG-level stderr logging |
+
+| `parse` argument | Required | Description |
+|---|---|---|
+| `--text "..."` *or* `--text-file PATH` | Yes | Expression text to analyse (one of) |
+| `--prompt-key KEY` | No | Simulate a prompt key so `NewFormExpression` can be built |
+
+#### Debugging from an IDE (PyCharm, VS Code)
+
+The script's `__main__` block has an "IDE debug" path that activates when no
+CLI args are supplied (which is what PyCharm does by default when you press
+Debug on the file). Edit `_ide_debug_argv()` near the bottom of the script to
+pick a scenario, set breakpoints, and run.
+
+```python
+def _ide_debug_argv() -> list[str]:
+    return [
+        sys.argv[0],
+
+        # 1) `debug` walkthrough on a single attribute
+        "debug", "qa",
+        "--project-id",   "DB51FDAA428EACA827892C9A301D6012",
+        "--attribute-id", "A60F2B7E4029DF6CFDF4CE8D1915B535",
+        "--output",       "c:/tmp/debug.csv",
+        "--verbose",
+
+        # 2) `export` filtered to one attribute
+        # "export", "qa",
+        # "--project",      "DB51FDAA428EACA827892C9A301D6012",
+        # "--attribute-id", "A60F2B7E4029DF6CFDF4CE8D1915B535",
+        # ...
+    ]
+```
+
+Useful breakpoints:
+
+| Function | What to inspect |
+|---|---|
+| `cmd_export` | Top-level workflow, project loop, row aggregation |
+| `_list_attributes` | The 3-attempt fallback chain (which path produced results) |
+| `_list_attributes_via_full_search` | mstrio-py `full_search` call + return value |
+| `_list_attributes_via_rest` | REST `POST /v2/full-search` body and response |
+| `_list_attributes_via_searches_results` | REST `GET /searches/results` params and response |
+| `_process_attribute` | Per-attribute fetch, form classification, row build |
+| `_fetch_attribute_def` | `/model/attributes/{id}` response shape |
+| `find_doc_prompt_by_source_attr` | Document-prompt lookup |
+| `build_new_form_expression` | Concat() builder |
+
+#### Search fallback chain
+
+`_list_attributes` tries three approaches in order — uses the first that
+returns rows. Each attempt logs at INFO level:
+
+| Attempt | API | Notes |
+|---|---|---|
+| 1 | mstrio-py `full_search(connection, project=PID, object_types=12, to_dictionary=True, get_ancestors=True)` | Canonical mstrio-py path; explicitly calls `conn.select_project(project_id=PID)` first |
+| 2 | `POST /api/v2/full-search` with `{projectId, objectTypes:[12], pattern:"*", domain:2}` | REST direct |
+| 3 | `GET /api/searches/results?type=12&searchType=CONTAINS&name=&domain=2` | Legacy REST path with the explicit `searchType` + `name` parameters some I-Servers require for schema objects |
+
+If all three return 0, the script logs an error and the user almost certainly
+lacks read permission on schema objects in that project.
+
+#### Debugging workflow
+
+Use `debug` when `export` finds nothing or builds a blank `NewFormExpression`
+on an attribute you know should match. It walks through every step
+verbosely so you can see exactly which piece is missing:
+
+```bash
+# Inspect a specific attribute end-to-end
+python AttributeFormHtmlManage.py debug dev \
+    --project-id 4329F00B4E06B3525A05C48929CA6E51 \
+    --attribute-id A60F2B7E4029DF6CFDF4CE8D1915B535
+
+# Same, but also dump the raw API JSON
+python AttributeFormHtmlManage.py debug dev \
+    --project-id 4329F00B4E06B3525A05C48929CA6E51 \
+    --attribute-id A60F2B7E4029DF6CFDF4CE8D1915B535 \
+    --show-raw --show-doc-prompts
+```
+
+The output is structured in five sections:
+
+1. **Fetch** — the `/model/attributes/{id}` call result
+2. **Classify** — per-form `displayFormat` and HTML detection
+3. **Process HTML forms** — `expression.text`, regex parse output, prompt lookup
+4. **Build** — the generated `NewFormExpression` (or a list of which pieces are missing)
+5. **Run `_process_attribute` (cross-check)** — the same function `export` uses,
+   so you can see whether the export pipeline would actually emit those rows.
+   Pass `--output PATH` to also write them to a CSV — the structure matches the
+   regular `export` output exactly, just scoped to one attribute. This is the
+   quickest way to verify that an attribute `debug` shows as having valid HTML
+   forms will actually appear in the export CSV.
+
+If you only need to verify the regex / builder logic against an
+expression you've copied out of the CSV (no API calls), use `parse`:
+
+```bash
+python AttributeFormHtmlManage.py parse \
+    --text 'Concat("<a  title=""",ProductName,""" href=...)' \
+    --prompt-key '15B83F05424BFB5A0B84848A9F367801@0@10'
+```
+
+#### Examples
+
+```bash
+# Scan all loaded projects on dev
+python AttributeFormHtmlManage.py export dev
+
+# Scan only two specific projects, restrict to recently-modified attributes
+python AttributeFormHtmlManage.py export qa \
+    --project ABCDEF1234567890ABCDEF1234567890 1111222233334444555566667777EEEE \
+    --modified-since 2026-01-01
+
+# Limit to a handful of known attribute GUIDs (skips the search)
+python AttributeFormHtmlManage.py export dev \
+    --project 4329F00B4E06B3525A05C48929CA6E51 \
+    --attribute-id A60F2B7E4029DF6CFDF4CE8D1915B535 EB990EA04D3F749C047F41800121E11B
+
+# Review/edit the CSV, then dry-run the apply
+python AttributeFormHtmlManage.py apply dev -i c:/tmp/attribute_form_html.csv
+
+# Commit the updates
+python AttributeFormHtmlManage.py apply dev -i c:/tmp/attribute_form_html.csv --apply
+```
 
 ---
 
