@@ -7,6 +7,14 @@ Iterates every loaded project, retrieves all subscriptions (including last_run
 where the server supports it), and writes one row per recipient so the output
 can be sorted or filtered by user, delivery mode, schedule, etc.
 
+Address resolution
+──────────────────
+Each recipient dict includes `addressId` + `addressName` but not the physical
+path.  The script resolves paths in a second pass: all unique recipient user
+IDs are collected, their ContactAddresses are fetched in parallel via
+ThreadPoolExecutor, and the physical_address column is filled from that lookup.
+Groups (isGroup=true) have no per-recipient address and are left blank.
+
 Output columns
 ──────────────
   project_id / project_name
@@ -23,11 +31,14 @@ Output columns
   owner_id / owner_name
   date_created / date_modified
   last_run                 Last execution time (requires server ≥ 11.4.0600).
-  recipient_id / recipient_name
-  recipient_type           USER | CONTACT | USER_GROUP | CONTACT_GROUP | PERSONAL_ADDRESS
+  recipient_id             User or group GUID.
+  recipient_name
+  recipient_type           user | usergroup | contact | contactgroup | …
   recipient_include_type   TO | CC | BCC
-  physical_address         Physical delivery address when embedded in the
-                           API response (email address or file path).
+  address_id               ContactAddress GUID (from addressId in recipient).
+  address_name             ContactAddress name (from addressName in recipient).
+  physical_address         Resolved from User.addresses lookup (email or file
+                           path); blank for groups or when not found.
 
 Connection
 ──────────
@@ -39,17 +50,20 @@ Usage
   python SubscriptionsExport.py dev
   python SubscriptionsExport.py dev --format json
   python SubscriptionsExport.py dev --output-dir C:/tmp
-  python SubscriptionsExport.py dev --project-id GUID1 GUID2   # limit to specific projects
+  python SubscriptionsExport.py dev --project-id GUID1 GUID2
+  python SubscriptionsExport.py dev --concurrency 20
 """
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
 from mstrio.server import Environment
+from mstrio.users_and_groups import User
 
 from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
 from mstrio_core.config import MstrEnvironment
@@ -57,11 +71,10 @@ from mstrio_core.config import MstrEnvironment
 # ── Workstation import (uncomment when running from Workstation) ──────────────
 # from mstrio.connection import get_connection
 
-# ── Lazy import — list_subscriptions may not exist on older mstrio-py builds ─
 try:
     from mstrio.distribution_services import list_subscriptions
 except ImportError:
-    list_subscriptions = None  # handled gracefully in main
+    list_subscriptions = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -69,6 +82,10 @@ except ImportError:
 
 CSV_FILENAME  = 'subscriptions_export_{env}_{ts}.csv'
 JSON_FILENAME = 'subscriptions_export_{env}_{ts}.json'
+DEFAULT_CONCURRENCY = 10
+
+# Group recipient types — no individual address to resolve
+_GROUP_TYPES = {'usergroup', 'user_group', 'contactgroup', 'contact_group', 'group'}
 
 COLUMNS = [
     'project_id',
@@ -92,15 +109,17 @@ COLUMNS = [
     'recipient_name',
     'recipient_type',
     'recipient_include_type',
+    'address_id',
+    'address_name',
     'physical_address',
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  RAW-DICT HELPERS
+#  list_subscriptions(to_dictionary=True) returns raw camelCase API dicts.
+#  Helpers below accept both camelCase and snake_case defensively.
 # ══════════════════════════════════════════════════════════════════════════════
-# list_subscriptions(to_dictionary=True) returns the raw API dicts (camelCase).
-# The helpers below accept both camelCase and snake_case keys defensively.
 
 def _v(d: dict, *keys, default: str = '') -> str:
     """Return the first non-None value found under any of the given keys."""
@@ -112,7 +131,7 @@ def _v(d: dict, *keys, default: str = '') -> str:
 
 
 def _fmt_dt(val) -> str:
-    """Format a datetime or ISO string for output."""
+    """Format a datetime or ISO string for output; empty string if None."""
     if val is None:
         return ''
     if isinstance(val, datetime):
@@ -121,7 +140,7 @@ def _fmt_dt(val) -> str:
 
 
 def _join(items: list, key: str) -> str:
-    """Build a semicolon-separated string of `key` from a list of dicts."""
+    """Semicolon-separated string of `key` values from a list of dicts."""
     return '; '.join(
         str(i.get(key) or '')
         for i in (items or [])
@@ -130,47 +149,90 @@ def _join(items: list, key: str) -> str:
 
 
 def _delivery_fields(delivery: dict) -> tuple[str, str, str]:
-    """
-    Return (mode, delivery_filename, email_subject) from the raw delivery dict.
-
-    The delivery dict has a top-level 'mode' key and a nested sub-object keyed
-    by the mode name in lowercase, e.g. {'mode': 'FILE', 'file': {'filename': '…'}}.
-    """
+    """Return (mode, delivery_filename, email_subject) from the raw delivery dict."""
     if not delivery:
         return '', '', ''
-
-    mode = (_v(delivery, 'mode') or '').upper()
+    mode     = (_v(delivery, 'mode') or '').upper()
     mode_key = mode.lower()
-    sub = delivery.get(mode_key) or {}
-
+    sub      = delivery.get(mode_key) or {}
     filename = _v(sub, 'filename', 'fileName', 'file_name')
     subject  = _v(sub, 'subject')
-
     return mode, filename, subject
 
 
-def _recipient_address(rec: dict) -> str:
-    """
-    Extract the physical delivery address embedded in a recipient dict when
-    the API includes it (not all server versions do).
+def _is_group_recipient(rec: dict) -> bool:
+    """Return True if this recipient is a group (no per-user address to resolve)."""
+    if rec.get('isGroup') or rec.get('is_group'):
+        return True
+    rec_type = (_v(rec, 'type') or '').lower().replace(' ', '')
+    return rec_type in _GROUP_TYPES
 
-    Expected shape:
-        {"address": {"physicalAddress": "user@example.com"}}
-    or  {"address": {"physical_address": "\\\\server\\path"}}
-    """
-    addr = rec.get('address') or {}
-    return _v(addr, 'physicalAddress', 'physical_address')
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  ADDRESS LOOKUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_address_lookup(
+    conn,
+    user_ids: set[str],
+    concurrency: int,
+) -> dict[str, dict[str, str]]:
+    """
+    Fetch ContactAddresses for every user_id in parallel.
+
+    Returns:
+        {user_id: {address_id: physical_address}}
+    """
+    if not user_ids:
+        return {}
+
+    logger.info(
+        'Resolving addresses for {n} unique recipient user(s)...', n=len(user_ids),
+    )
+
+    lookup: dict[str, dict[str, str]] = {}
+
+    def _fetch(uid: str) -> tuple[str, dict[str, str]]:
+        try:
+            user = User(conn, id=uid)
+            return uid, {
+                addr.id: (addr.physical_address or '')
+                for addr in (user.addresses or [])
+            }
+        except Exception as exc:
+            logger.warning(
+                'Could not fetch addresses for user {uid}: {err}', uid=uid, err=exc,
+            )
+            return uid, {}
+
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(_fetch, uid): uid for uid in user_ids}
+        done = 0
+        for future in as_completed(futures):
+            uid, addrs = future.result()
+            if addrs:
+                lookup[uid] = addrs
+            done += 1
+            if done % 50 == 0:
+                logger.debug('  Address lookup: {done}/{total}', done=done, total=len(user_ids))
+
+    logger.info('Address lookup complete ({n} user(s) resolved)', n=len(lookup))
+    return lookup
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FLATTENING
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _flatten_subscription(
     sub: dict,
     project_id: str,
     project_name: str,
+    addr_lookup: dict[str, dict[str, str]],
 ) -> list[dict]:
     """
     Expand a raw subscription dict into one output row per recipient.
-    Returns [] for subscriptions with no recipients (should not occur in
-    practice, but handled defensively).
+    Resolves physical_address from addr_lookup when available.
     """
     sub_id   = _v(sub, 'id')
     sub_name = _v(sub, 'name')
@@ -201,29 +263,41 @@ def _flatten_subscription(
 
     rows = []
     for rec in recipients:
+        rec_id   = _v(rec, 'id')
+        addr_id  = _v(rec, 'addressId',   'address_id')
+        addr_nm  = _v(rec, 'addressName', 'address_name')
+
+        if _is_group_recipient(rec):
+            phys = ''
+        else:
+            user_addrs = addr_lookup.get(rec_id) or {}
+            phys = user_addrs.get(addr_id, '')
+
         rows.append({
-            'project_id':           project_id,
-            'project_name':         project_name,
-            'subscription_id':      sub_id,
-            'subscription_name':    sub_name,
-            'delivery_mode':        mode,
-            'delivery_filename':    filename,
-            'email_subject':        subject,
-            'schedule_ids':         sch_ids,
-            'schedule_names':       sch_names,
-            'content_ids':          cnt_ids,
-            'content_names':        cnt_names,
-            'content_types':        cnt_types,
-            'owner_id':             owner_id,
-            'owner_name':           owner_nm,
-            'date_created':         date_created,
-            'date_modified':        date_modified,
-            'last_run':             last_run,
-            'recipient_id':         _v(rec, 'id'),
-            'recipient_name':       _v(rec, 'name'),
-            'recipient_type':       _v(rec, 'type'),
+            'project_id':             project_id,
+            'project_name':           project_name,
+            'subscription_id':        sub_id,
+            'subscription_name':      sub_name,
+            'delivery_mode':          mode,
+            'delivery_filename':      filename,
+            'email_subject':          subject,
+            'schedule_ids':           sch_ids,
+            'schedule_names':         sch_names,
+            'content_ids':            cnt_ids,
+            'content_names':          cnt_names,
+            'content_types':          cnt_types,
+            'owner_id':               owner_id,
+            'owner_name':             owner_nm,
+            'date_created':           date_created,
+            'date_modified':          date_modified,
+            'last_run':               last_run,
+            'recipient_id':           rec_id,
+            'recipient_name':         _v(rec, 'name'),
+            'recipient_type':         _v(rec, 'type'),
             'recipient_include_type': _v(rec, 'includeType', 'include_type'),
-            'physical_address':     _recipient_address(rec),
+            'address_id':             addr_id,
+            'address_name':           addr_nm,
+            'physical_address':       phys,
         })
 
     return rows
@@ -238,6 +312,7 @@ def main(
     fmt: str,
     output_dir: Optional[Path],
     filter_project_ids: Optional[list[str]],
+    concurrency: int,
 ) -> int:
 
     if list_subscriptions is None:
@@ -266,9 +341,10 @@ def main(
 
     logger.info('{n} project(s) to process', n=len(all_projects))
 
-    all_rows: list[dict] = []
+    # ── PASS 1: collect all subscription dicts and recipient user IDs ─────────
+    project_subs: list[tuple[str, str, list[dict]]] = []
+    recipient_user_ids: set[str] = set()
     total_subs = 0
-    total_rows = 0
 
     for proj in all_projects:
         logger.info('  [{name}]  fetching subscriptions...', name=proj.name)
@@ -289,16 +365,30 @@ def main(
         logger.info(
             '  [{name}]  {n} subscription(s)', name=proj.name, n=len(subs),
         )
+        project_subs.append((proj.id, proj.name, subs))
         total_subs += len(subs)
 
         for sub in subs:
-            rows = _flatten_subscription(sub, proj.id, proj.name)
-            all_rows.extend(rows)
-            total_rows += len(rows)
+            for rec in (sub.get('recipients') or []):
+                uid    = _v(rec, 'id')
+                addr_id = _v(rec, 'addressId', 'address_id')
+                if uid and addr_id and not _is_group_recipient(rec):
+                    recipient_user_ids.add(uid)
 
+    # ── PASS 2: resolve physical addresses ────────────────────────────────────
+    addr_lookup = _build_address_lookup(conn, recipient_user_ids, concurrency)
+
+    # ── PASS 3: flatten to rows ───────────────────────────────────────────────
+    all_rows: list[dict] = []
+    for project_id, project_name, subs in project_subs:
+        for sub in subs:
+            rows = _flatten_subscription(sub, project_id, project_name, addr_lookup)
+            all_rows.extend(rows)
+
+    total_rows = len(all_rows)
     logger.info(
         'Total: {s} subscription(s) → {r} row(s) ({p} project(s))',
-        s=total_subs, r=total_rows, p=len(all_projects),
+        s=total_subs, r=total_rows, p=len(project_subs),
     )
 
     # ── OUTPUT ────────────────────────────────────────────────────────────────
@@ -331,7 +421,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=(
             'Export all MicroStrategy subscriptions across every loaded project. '
-            'One row per recipient.'
+            'One row per recipient, with physical delivery address resolved.'
         )
     )
     parser.add_argument(
@@ -360,6 +450,13 @@ if __name__ == '__main__':
         dest='filter_project_ids',
         help='Limit to specific project GUIDs (default: all loaded projects).',
     )
+    parser.add_argument(
+        '--concurrency',
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        metavar='N',
+        help=f'Parallel workers for address resolution (default: {DEFAULT_CONCURRENCY}).',
+    )
 
     args = parser.parse_args()
 
@@ -369,5 +466,6 @@ if __name__ == '__main__':
             fmt=args.fmt,
             output_dir=args.output_dir,
             filter_project_ids=args.filter_project_ids,
+            concurrency=args.concurrency,
         )
     )
