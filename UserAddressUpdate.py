@@ -158,18 +158,24 @@ def _normalize_delivery_type(raw: str) -> Optional[str]:
 def _build_device_lookup(conn) -> dict[str, str]:
     """
     Load all devices and return a case-insensitive name → device_id dict.
+    Uses to_dictionary=True to avoid DeviceType enum errors for unknown types
+    (e.g. 'gcs') that may exist on the server but not in the installed mstrio-py.
     When multiple devices share the same name, the first one wins.
     """
-    devices = list_devices(conn, to_dictionary=False)
+    devices = list_devices(conn, to_dictionary=True)
     lookup: dict[str, str] = {}
     for dev in devices:
-        key = dev.name.lower()
+        name = dev.get('name') or ''
+        did  = dev.get('id')   or ''
+        if not name or not did:
+            continue
+        key = name.lower()
         if key in lookup:
             logger.warning(
-                'Multiple devices named {name!r} — using first match', name=dev.name,
+                'Multiple devices named {name!r} — using first match', name=name,
             )
         else:
-            lookup[key] = dev.id
+            lookup[key] = did
     logger.info('Loaded {n} device(s)', n=len(lookup))
     return lookup
 
