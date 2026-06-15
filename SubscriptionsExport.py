@@ -39,6 +39,10 @@ Output columns
   address_name             ContactAddress name (from addressName in recipient).
   physical_address         Resolved from User.addresses lookup (email or file
                            path); blank for groups or when not found.
+  device_id                Device GUID backing the recipient's address (from
+                           ContactAddress.device); blank for groups. Join key
+                           to the device → GoAnywhere mapping.
+  device_name              Device name backing the recipient's address.
 
 Connection
 ──────────
@@ -112,6 +116,8 @@ COLUMNS = [
     'address_id',
     'address_name',
     'physical_address',
+    'device_id',
+    'device_name',
 ]
 
 
@@ -181,7 +187,7 @@ def _build_address_lookup(
     Fetch ContactAddresses for every user_id in parallel.
 
     Returns:
-        {user_id: {address_id: physical_address}}
+        {user_id: {address_id: {"physical_address", "device_id", "device_name"}}}
     """
     if not user_ids:
         return {}
@@ -190,15 +196,20 @@ def _build_address_lookup(
         'Resolving addresses for {n} unique recipient user(s)...', n=len(user_ids),
     )
 
-    lookup: dict[str, dict[str, str]] = {}
+    lookup: dict[str, dict[str, dict[str, str]]] = {}
 
-    def _fetch(uid: str) -> tuple[str, dict[str, str]]:
+    def _fetch(uid: str) -> tuple[str, dict[str, dict[str, str]]]:
         try:
             user = User(conn, id=uid)
-            return uid, {
-                addr.id: (addr.physical_address or '')
-                for addr in (user.addresses or [])
-            }
+            addrs: dict[str, dict[str, str]] = {}
+            for addr in (user.addresses or []):
+                dev = addr.device
+                addrs[addr.id] = {
+                    'physical_address': addr.physical_address or '',
+                    'device_id':        dev.id if dev else '',
+                    'device_name':      dev.name if dev else '',
+                }
+            return uid, addrs
         except Exception as exc:
             logger.warning(
                 'Could not fetch addresses for user {uid}: {err}', uid=uid, err=exc,
@@ -228,11 +239,11 @@ def _flatten_subscription(
     sub: dict,
     project_id: str,
     project_name: str,
-    addr_lookup: dict[str, dict[str, str]],
+    addr_lookup: dict[str, dict[str, dict[str, str]]],
 ) -> list[dict]:
     """
     Expand a raw subscription dict into one output row per recipient.
-    Resolves physical_address from addr_lookup when available.
+    Resolves physical_address, device_id, device_name from addr_lookup.
     """
     sub_id   = _v(sub, 'id')
     sub_name = _v(sub, 'name')
@@ -268,10 +279,13 @@ def _flatten_subscription(
         addr_nm  = _v(rec, 'addressName', 'address_name')
 
         if _is_group_recipient(rec):
-            phys = ''
+            phys = device_id = device_name = ''
         else:
             user_addrs = addr_lookup.get(rec_id) or {}
-            phys = user_addrs.get(addr_id, '')
+            addr_info  = user_addrs.get(addr_id) or {}
+            phys        = addr_info.get('physical_address', '')
+            device_id   = addr_info.get('device_id', '')
+            device_name = addr_info.get('device_name', '')
 
         rows.append({
             'project_id':             project_id,
@@ -298,6 +312,8 @@ def _flatten_subscription(
             'address_id':             addr_id,
             'address_name':           addr_nm,
             'physical_address':       phys,
+            'device_id':              device_id,
+            'device_name':            device_name,
         })
 
     return rows
