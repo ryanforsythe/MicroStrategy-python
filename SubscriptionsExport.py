@@ -7,12 +7,25 @@ Iterates every loaded project, retrieves all subscriptions (including last_run
 where the server supports it), and writes one row per recipient so the output
 can be sorted or filtered by user, delivery mode, schedule, etc.
 
+Output modes
+────────────
+  --format csv  (default) : flat, one row per recipient (see columns below).
+  --format json           : COMPREHENSIVE — one full nested object per
+                            subscription (raw definition: contents +
+                            personalization, delivery, recipients, schedules),
+                            with each non-group recipient enriched with its
+                            resolved physical_address / device_id / device_name,
+                            AND for prompted subscriptions the prompt definitions
+                            + saved answers from /subscriptions/{id}/prompts.
+                            The per-prompt `key` + `answers` are what a recreation
+                            step needs to re-apply answers on a target env.
+
 Address resolution
 ──────────────────
 Each recipient dict includes `addressId` + `addressName` but not the physical
 path.  The script resolves paths in a second pass: all unique recipient user
 IDs are collected, their ContactAddresses are fetched in parallel via
-ThreadPoolExecutor, and the physical_address column is filled from that lookup.
+ThreadPoolExecutor, and the physical_address is filled from that lookup.
 Groups (isGroup=true) have no per-recipient address and are left blank.
 
 Output columns
@@ -79,6 +92,12 @@ try:
     from mstrio.distribution_services import list_subscriptions
 except ImportError:
     list_subscriptions = None
+
+try:
+    # Per-subscription prompt definitions + saved answers (for comprehensive JSON)
+    from mstrio.api.subscriptions import get_subscription_prompts
+except ImportError:
+    get_subscription_prompts = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -320,6 +339,84 @@ def _flatten_subscription(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  COMPREHENSIVE JSON (full definition + prompt answers + resolved addresses)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _subscription_has_prompts(sub: dict) -> bool:
+    """True if any content of the subscription has a prompt enabled."""
+    for c in (sub.get('contents') or []):
+        prompt = (c.get('personalization') or {}).get('prompt') or {}
+        if prompt.get('enabled'):
+            return True
+    return False
+
+
+def _enrich_recipient_addresses(sub: dict, addr_lookup: dict) -> None:
+    """Add resolved physical_address / device_id / device_name onto each
+    non-group recipient dict (in place)."""
+    for rec in (sub.get('recipients') or []):
+        if _is_group_recipient(rec):
+            continue
+        uid     = _v(rec, 'id')
+        addr_id = _v(rec, 'addressId', 'address_id')
+        info = (addr_lookup.get(uid) or {}).get(addr_id) or {}
+        rec['physical_address'] = info.get('physical_address', '')
+        rec['device_id']        = info.get('device_id', '')
+        rec['device_name']      = info.get('device_name', '')
+
+
+def _build_comprehensive(conn, project_subs, addr_lookup, concurrency) -> list[dict]:
+    """Build one full nested object per subscription: the raw definition plus
+    resolved recipient addresses and, for prompted subscriptions, the prompt
+    definitions + saved answers from /subscriptions/{id}/prompts.
+
+    The prompt `key` + `answers` captured here are what a recreation step needs
+    to re-apply answers on the target environment.
+    """
+    # Which subscriptions are prompted (limit the extra REST calls)
+    prompt_targets: list[tuple[str, str]] = []
+    if get_subscription_prompts is not None:
+        for pid, _pname, subs in project_subs:
+            for sub in subs:
+                if _subscription_has_prompts(sub):
+                    sid = _v(sub, 'id')
+                    if sid:
+                        prompt_targets.append((pid, sid))
+
+    prompts_map: dict[tuple[str, str], list] = {}
+    if prompt_targets:
+        logger.info('Fetching prompt answers for {n} prompted subscription(s)...',
+                    n=len(prompt_targets))
+
+        def _fetch(pid: str, sid: str):
+            try:
+                resp = get_subscription_prompts(conn, subscription_id=sid, project_id=pid)
+                return (pid, sid), (resp.json().get('prompts') or [])
+            except Exception as exc:
+                logger.warning('Prompt fetch failed for {sid}: {e}', sid=sid, e=exc)
+                return (pid, sid), []
+
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futures = [pool.submit(_fetch, pid, sid) for pid, sid in prompt_targets]
+            for fut in as_completed(futures):
+                key, prompts = fut.result()
+                prompts_map[key] = prompts
+
+    out: list[dict] = []
+    for pid, pname, subs in project_subs:
+        for sub in subs:
+            sub = dict(sub)  # shallow copy; we add a few keys
+            sub.setdefault('project_id', pid)
+            sub.setdefault('project_name', pname)
+            _enrich_recipient_addresses(sub, addr_lookup)
+            prompts = prompts_map.get((pid, _v(sub, 'id')))
+            if prompts is not None:
+                sub['prompts'] = prompts
+            out.append(sub)
+    return out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -394,36 +491,41 @@ def main(
     # ── PASS 2: resolve physical addresses ────────────────────────────────────
     addr_lookup = _build_address_lookup(conn, recipient_user_ids, concurrency)
 
-    # ── PASS 3: flatten to rows ───────────────────────────────────────────────
-    all_rows: list[dict] = []
-    for project_id, project_name, subs in project_subs:
-        for sub in subs:
-            rows = _flatten_subscription(sub, project_id, project_name, addr_lookup)
-            all_rows.extend(rows)
-
-    total_rows = len(all_rows)
-    logger.info(
-        'Total: {s} subscription(s) → {r} row(s) ({p} project(s))',
-        s=total_subs, r=total_rows, p=len(project_subs),
-    )
-
     # ── OUTPUT ────────────────────────────────────────────────────────────────
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == 'json':
+        # Comprehensive: full nested definition + prompt answers + resolved addresses.
+        comprehensive = _build_comprehensive(conn, project_subs, addr_lookup, concurrency)
+        prompted = sum(1 for s in comprehensive if s.get('prompts'))
+        logger.info(
+            'Total: {s} subscription(s), {pr} with prompt answers ({p} project(s))',
+            s=total_subs, pr=prompted, p=len(project_subs),
+        )
         out_file = out_dir / JSON_FILENAME.format(env=env, ts=ts)
         out_file.write_text(
-            json.dumps(all_rows, ensure_ascii=False, indent=2),
+            json.dumps(comprehensive, ensure_ascii=False, indent=2),
             encoding='utf-8',
         )
-        logger.success('JSON written → {p}  ({n} rows)', p=out_file, n=total_rows)
-        print(f'\nExported: {out_file}')
+        logger.success('Comprehensive JSON written → {p}  ({n} subscriptions, {pr} prompted)',
+                       p=out_file, n=len(comprehensive), pr=prompted)
+        print(f'\nExported: {out_file}  ({len(comprehensive)} subscriptions, {prompted} with prompt answers)')
     else:
+        # Flat: one row per recipient.
+        all_rows: list[dict] = []
+        for project_id, project_name, subs in project_subs:
+            for sub in subs:
+                all_rows.extend(
+                    _flatten_subscription(sub, project_id, project_name, addr_lookup))
+        logger.info(
+            'Total: {s} subscription(s) → {r} row(s) ({p} project(s))',
+            s=total_subs, r=len(all_rows), p=len(project_subs),
+        )
         out_file = out_dir / CSV_FILENAME.format(env=env, ts=ts)
         csv_rows = [[r.get(c, '') for c in COLUMNS] for r in all_rows]
         write_csv(csv_rows, columns=COLUMNS, path=out_file)
-        logger.success('CSV written → {p}  ({n} rows)', p=out_file, n=total_rows)
+        logger.success('CSV written → {p}  ({n} rows)', p=out_file, n=len(all_rows))
         print(f'\nExported: {out_file}')
 
     return 0
