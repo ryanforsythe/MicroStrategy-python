@@ -1,10 +1,16 @@
 """
-ContentGroupAdd.py — Add objects to a MicroStrategy content group.
+ContentGroupAdd.py — Add objects to (or export objects from) a MicroStrategy
+content group.
 
-Supports two input modes:
-  1. CSV file with a "GUID" column (additional columns are ignored)
-  2. Folder GUID — adds all non-hidden, non-folder contents; resolves shortcuts
-     to their target objects
+Supports three modes:
+  1. csv    — add objects from a CSV file with a "GUID" column
+  2. folder — add all non-hidden, non-folder contents of a folder (shortcuts
+              resolved to their targets)
+  3. export — read the objects currently in a content group and write them to a
+              CSV. The output uses the SAME schema as the input CSV, so the file
+              can be fed straight into `csv` on another environment to replicate
+              the content group there (object GUIDs are preserved across
+              environments).
 
 Content groups accept: Dashboard, Document, Report.
 
@@ -16,6 +22,9 @@ Usage
   python ContentGroupAdd.py folder <env> --content-group <name-or-id> --folder <guid>
                                    [--project <name>] [--apply] [--output-dir PATH]
 
+  python ContentGroupAdd.py export <env> --content-group <name-or-id>
+                                   [--project <name>] [--output-dir PATH]
+
 Examples
 ────────
   # Dry-run: preview what would be added from a CSV
@@ -26,6 +35,14 @@ Examples
 
   # Add all non-hidden objects from a folder
   python ContentGroupAdd.py folder qa --content-group ABC123 --folder DEF456 --apply
+
+  # Export a content group's contents to a re-importable CSV
+  python ContentGroupAdd.py export dev --content-group "My Content Group"
+
+  # Migrate a content group dev -> prod: export from dev, then add to prod
+  python ContentGroupAdd.py export dev  --content-group "My Content Group"
+  python ContentGroupAdd.py csv    prod --content-group "My Content Group" \\
+      --csv c:/tmp/content_group_export_dev.csv --apply
 
   # Specify a project (overrides MSTR_PROJECT_NAME from env)
   python ContentGroupAdd.py folder prod --content-group "Dashboards" --folder ABC123 \\
@@ -256,6 +273,46 @@ def _resolve_shortcut(session, shortcut_id):
     return None
 
 
+def _get_content_group_objects(session, cg_id, project_id):
+    """
+    Retrieve the objects in a content group for the given project.
+
+    Uses the REST API (GET /contentGroups/{id}/contents?projectId=...), which
+    returns id/name/type/subtype directly — richer than the SDK get_contents()
+    (which re-instantiates each object, triggering per-object fetches, and
+    silently drops types other than Report/Document/Dashboard/Agent).
+
+    The response is keyed by project id: {project_id: [ {id,name,type,...}, ... ]}.
+    Returns a flat list of dicts with 'id', 'name', 'type' keys.
+    """
+    r = session.get(
+        f"/contentGroups/{cg_id}/contents",
+        params={"projectId": project_id},
+    )
+    if not r.ok:
+        logger.error(
+            "HTTP {status} retrieving content group contents: {text}",
+            status=r.status_code, text=r.text,
+        )
+        return []
+
+    data = r.json() or {}
+    results = []
+    for _proj_key, contents in data.items():
+        for c in contents or []:
+            results.append({
+                "id": c.get("id"),
+                "name": c.get("name", ""),
+                "type": c.get("type", 0),
+            })
+
+    logger.info(
+        "Content group {cg}: {n} object(s) across {p} project(s)",
+        cg=cg_id, n=len(results), p=len(data),
+    )
+    return results
+
+
 def _resolve_object_types(session, guids):
     """
     For a list of GUIDs (from CSV), resolve each to get name and type.
@@ -478,10 +535,66 @@ def cmd_folder(
         write_csv(rows, columns=_OUTPUT_COLS, path=out_path)
 
 
+# ── Subcommand: export ───────────────────────────────────────────────────────
+
+
+def cmd_export(
+    env,
+    content_group,
+    project=None,
+    output_dir=None,
+):
+    """Export a content group's current objects to a re-importable CSV.
+
+    The output file uses the same columns as the add-input CSV, so it can be
+    passed to the `csv` subcommand on another environment to replicate the
+    content group's membership there.
+    """
+    config = MstrConfig(environment=MstrEnvironment(env))
+    out = output_dir or config.output_dir
+    Path(out).mkdir(parents=True, exist_ok=True)
+
+    with MstrRestSession(config) as session:
+        _set_project(session, config, project)
+        conn = session.mstrio_conn
+
+        # Resolve content group
+        cg_id, cg_name = _resolve_content_group_sdk(conn, content_group)
+        logger.info(
+            "Content group: {name} ({id})", name=cg_name, id=cg_id,
+        )
+
+        # Retrieve current contents (REST API)
+        objects = _get_content_group_objects(session, cg_id, session.project_id)
+        if not objects:
+            logger.warning(
+                "Content group '{name}' has no contents in project {pid}. "
+                "Nothing to export.",
+                name=cg_name, pid=session.project_id,
+            )
+            return
+
+        # Write output — same schema as the add-input CSV (GUID column drives re-import)
+        rows = []
+        for obj in objects:
+            type_name = OBJECT_TYPE_ID_MAP.get(obj["type"], str(obj["type"]))
+            rows.append([
+                obj["id"], obj["name"], type_name, obj["type"],
+                "ContentGroup", "EXPORTED",
+            ])
+
+        out_path = Path(out) / f"content_group_export_{env}.csv"
+        write_csv(rows, columns=_OUTPUT_COLS, path=out_path)
+        logger.success(
+            "Exported {n} object(s) from content group '{name}' to {path}",
+            n=len(rows), name=cg_name, path=out_path,
+        )
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 
-def _add_common_args(sub):
+def _add_common_args(sub, include_apply=True):
     """Add arguments shared by all subcommands."""
     sub.add_argument("env", choices=ENVS, help="Environment (dev, qa, prod).")
     sub.add_argument(
@@ -496,12 +609,13 @@ def _add_common_args(sub):
         metavar="NAME",
         help="Project name (overrides MSTR_PROJECT_NAME env var).",
     )
-    sub.add_argument(
-        "--apply",
-        action="store_true",
-        default=False,
-        help="Execute changes. Without this flag, runs in dry-run mode.",
-    )
+    if include_apply:
+        sub.add_argument(
+            "--apply",
+            action="store_true",
+            default=False,
+            help="Execute changes. Without this flag, runs in dry-run mode.",
+        )
     sub.add_argument(
         "--output-dir",
         type=Path,
@@ -546,6 +660,13 @@ if __name__ == "__main__":
         help="Folder GUID to read objects from.",
     )
 
+    # ── export ────────────────────────────────────────────────────────────
+    p_export = subparsers.add_parser(
+        "export",
+        help="Export a content group's contents to a re-importable CSV.",
+    )
+    _add_common_args(p_export, include_apply=False)  # read-only, no --apply
+
     # ── Dispatch ──────────────────────────────────────────────────────────
     args = parser.parse_args()
 
@@ -565,5 +686,12 @@ if __name__ == "__main__":
             folder_id=args.folder_id,
             project=args.project,
             apply=args.apply,
+            output_dir=args.output_dir,
+        )
+    elif args.subcommand == "export":
+        cmd_export(
+            env=args.env,
+            content_group=args.content_group,
+            project=args.project,
             output_dir=args.output_dir,
         )
