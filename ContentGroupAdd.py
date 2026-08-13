@@ -2,15 +2,20 @@
 ContentGroupAdd.py — Add objects to (or export objects from) a MicroStrategy
 content group.
 
-Supports three modes:
-  1. csv    — add objects from a CSV file with a "GUID" column
+Supports four modes:
+  1. csv    — add objects from a CSV file with a "GUID" column (single project)
   2. folder — add all non-hidden, non-folder contents of a folder (shortcuts
               resolved to their targets)
-  3. export — read the objects currently in a content group and write them to a
-              CSV. The output uses the SAME schema as the input CSV, so the file
-              can be fed straight into `csv` on another environment to replicate
-              the content group there (object GUIDs are preserved across
-              environments).
+  3. json   — add objects from a project-keyed JSON file ({project_id: [objects]}).
+              The target projects come FROM the file (not --project); each
+              project's objects are added under that project's context. This is
+              the multi-project re-import counterpart to `export --format json`.
+  4. export — read the objects currently in a content group and write them out.
+              --format csv  → single project, flat rows, feeds the `csv` mode.
+              --format json → ALL loaded projects, keyed by project id, empty
+                              projects omitted; feeds the `json` mode. This is the
+                              cross-env replication path (object GUIDs are
+                              preserved across environments).
 
 Content groups accept: Dashboard, Document, Report.
 
@@ -22,8 +27,11 @@ Usage
   python ContentGroupAdd.py folder <env> --content-group <name-or-id> --folder <guid>
                                    [--project <name>] [--apply] [--output-dir PATH]
 
+  python ContentGroupAdd.py json   <env> --content-group <name-or-id> --json <path>
+                                   [--apply] [--output-dir PATH]
+
   python ContentGroupAdd.py export <env> --content-group <name-or-id>
-                                   [--project <name>] [--output-dir PATH]
+                                   [--format csv|json] [--project <name>] [--output-dir PATH]
 
 Examples
 ────────
@@ -36,13 +44,14 @@ Examples
   # Add all non-hidden objects from a folder
   python ContentGroupAdd.py folder qa --content-group ABC123 --folder DEF456 --apply
 
-  # Export a content group's contents to a re-importable CSV
+  # Export a content group's contents (single project → CSV; all projects → JSON)
   python ContentGroupAdd.py export dev --content-group "My Content Group"
+  python ContentGroupAdd.py export dev --content-group "My Content Group" --format json
 
-  # Migrate a content group dev -> prod: export from dev, then add to prod
-  python ContentGroupAdd.py export dev  --content-group "My Content Group"
-  python ContentGroupAdd.py csv    prod --content-group "My Content Group" \\
-      --csv c:/tmp/content_group_export_dev.csv --apply
+  # Migrate a content group dev -> prod via JSON (multi-project, projects from file)
+  python ContentGroupAdd.py export dev  --content-group "My Content Group" --format json
+  python ContentGroupAdd.py json   prod --content-group "My Content Group" \\
+      --json c:/tmp/content_group_export_dev.json --apply
 
   # Specify a project (overrides MSTR_PROJECT_NAME from env)
   python ContentGroupAdd.py folder prod --content-group "Dashboards" --folder ABC123 \\
@@ -51,11 +60,13 @@ Examples
 
 import argparse
 import csv
+import json
 from pathlib import Path
 
 from loguru import logger
-from mstrio.project_objects import Dashboard, Document
+from mstrio.project_objects import Dashboard, Document, Report
 from mstrio.project_objects.content_group import ContentGroup, list_content_groups
+from mstrio.server import Environment
 
 from mstrio_core import (
     MstrConfig,
@@ -75,9 +86,11 @@ _SHORTCUT_TYPE = 18
 _FOLDER_TYPE = 8
 
 # Object types that ContentGroup accepts, mapped to mstrio-py classes.
-# Type 55 = Document/Dashboard
+# update_contents() sends only {id, type} where type = class._OBJECT_TYPE.value,
+# so Dashboard covers both Documents and Dashboards (both metadata type 55).
 _CONTENT_TYPE_MAP = {
-    55: Dashboard,   # Dashboard is the modern form of type 55 (Dossier)
+    3: Report,       # Report definition
+    55: Dashboard,   # Document / Dashboard (Dossier); both are type 55
 }
 
 _OUTPUT_COLS = [
@@ -273,43 +286,71 @@ def _resolve_shortcut(session, shortcut_id):
     return None
 
 
-def _get_content_group_objects(session, cg_id, project_id):
+def _read_contents_json(json_path):
     """
-    Retrieve the objects in a content group for the given project.
+    Read a project-keyed contents JSON file:
+        {project_id: [ {id, type, name, ...}, ... ], ...}
 
-    Uses the REST API (GET /contentGroups/{id}/contents?projectId=...), which
-    returns id/name/type/subtype directly — richer than the SDK get_contents()
-    (which re-instantiates each object, triggering per-object fetches, and
-    silently drops types other than Report/Document/Dashboard/Agent).
+    This is the same shape produced by `export --format json`. Projects with an
+    empty array are ignored. Returns {project_id: [objects]} for populated
+    projects only.
+    """
+    path = Path(json_path)
+    if not path.exists():
+        raise FileNotFoundError(f"JSON file not found: {path}")
 
-    The response is keyed by project id: {project_id: [ {id,name,type,...}, ... ]}.
-    Returns a flat list of dicts with 'id', 'name', 'type' keys.
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(
+            "JSON must be an object keyed by project id: "
+            "{project_id: [ {id, type, ...}, ... ]}"
+        )
+
+    populated = {pid: objs for pid, objs in data.items() if objs}
+    logger.info(
+        "Read {n} object(s) across {p} project(s) from {path}",
+        n=sum(len(v) for v in populated.values()),
+        p=len(populated), path=path,
+    )
+    return populated
+
+
+def _get_content_group_contents_raw(session, cg_id, project_ids):
+    """
+    Raw GET /contentGroups/{id}/contents response, keyed by project id:
+        {project_id: [ {id, name, type, subtype, ...}, ... ], ...}
+
+    `project_ids` may be a single id string or a list of ids (the API accepts
+    repeated projectId params and returns a key for each, including empty
+    arrays for projects with no content).
+
+    Uses REST rather than the SDK get_contents() because the latter
+    re-instantiates each object (per-object fetches) and silently drops types
+    other than Report/Document/Dashboard/Agent.
     """
     r = session.get(
         f"/contentGroups/{cg_id}/contents",
-        params={"projectId": project_id},
+        params={"projectId": project_ids},
     )
     if not r.ok:
         logger.error(
             "HTTP {status} retrieving content group contents: {text}",
             status=r.status_code, text=r.text,
         )
-        return []
+        return {}
+    return r.json() or {}
 
-    data = r.json() or {}
+
+def _flatten_contents(raw):
+    """Flatten {project_id: [objects]} → list of {'id','name','type'} dicts."""
     results = []
-    for _proj_key, contents in data.items():
+    for _proj_key, contents in (raw or {}).items():
         for c in contents or []:
             results.append({
                 "id": c.get("id"),
                 "name": c.get("name", ""),
                 "type": c.get("type", 0),
             })
-
-    logger.info(
-        "Content group {cg}: {n} object(s) across {p} project(s)",
-        cg=cg_id, n=len(results), p=len(data),
-    )
     return results
 
 
@@ -535,6 +576,74 @@ def cmd_folder(
         write_csv(rows, columns=_OUTPUT_COLS, path=out_path)
 
 
+# ── Subcommand: json ─────────────────────────────────────────────────────────
+
+
+def cmd_json(
+    env,
+    content_group,
+    json_path,
+    apply=False,
+    output_dir=None,
+):
+    """Add objects to a content group from a project-keyed JSON file.
+
+    The JSON (same shape as `export --format json`) is keyed by project id, so
+    the target projects come from the file itself — no --project/--folder is
+    used. Each project's objects are added under that project's context, because
+    ContentGroup.update_contents() derives the add path from the object's
+    connection project.
+    """
+    config = MstrConfig(environment=MstrEnvironment(env))
+    out = output_dir or config.output_dir
+    Path(out).mkdir(parents=True, exist_ok=True)
+
+    project_map = _read_contents_json(json_path)
+    if not project_map:
+        logger.warning("No populated projects in JSON. Nothing to add.")
+        return
+
+    with MstrRestSession(config) as session:
+        conn = session.mstrio_conn
+
+        # Resolve the content group once (config-level object). Select the first
+        # project so the connection is project-scoped for the lookup.
+        first_pid = next(iter(project_map))
+        session.set_project(project_id=first_pid)
+        cg_id, cg_name = _resolve_content_group_sdk(conn, content_group)
+        logger.info("Content group: {name} ({id})", name=cg_name, id=cg_id)
+
+        mode = "APPLY" if apply else "DRY-RUN"
+        logger.info("Mode: {mode}", mode=mode)
+
+        all_results = []
+        for pid, objs in project_map.items():
+            # Must select the project BEFORE building objects — update_contents()
+            # uses content.connection.project_id for the add path. One project's
+            # objects per update_contents() call (all share the one connection).
+            session.set_project(project_id=pid)
+            objects = [
+                {"id": o.get("id"), "name": o.get("name", ""), "type": o.get("type", 0)}
+                for o in objs if o.get("id")
+            ]
+            logger.info(
+                "Project {pid}: {n} object(s)", pid=pid, n=len(objects),
+            )
+            results = _add_to_content_group(conn, cg_id, cg_name, objects, apply)
+            for r in results:
+                r["project_id"] = pid
+            all_results.extend(results)
+
+        # Write output — same schema as the add-input CSV; Source carries project id
+        rows = [
+            [r["id"], r["name"], r["type_name"], r["type_id"],
+             f"JSON:{r.get('project_id', '')}", r["status"]]
+            for r in all_results
+        ]
+        out_path = Path(out) / f"content_group_add_{env}.csv"
+        write_csv(rows, columns=_OUTPUT_COLS, path=out_path)
+
+
 # ── Subcommand: export ───────────────────────────────────────────────────────
 
 
@@ -543,12 +652,15 @@ def cmd_export(
     content_group,
     project=None,
     output_dir=None,
+    fmt="csv",
 ):
-    """Export a content group's current objects to a re-importable CSV.
+    """Export a content group's current objects to a re-importable file.
 
-    The output file uses the same columns as the add-input CSV, so it can be
-    passed to the `csv` subcommand on another environment to replicate the
-    content group's membership there.
+    csv  — single project (--project / env default), flat rows. Feeds the `csv`
+           subcommand on another environment (GUID column drives re-import).
+    json — comprehensive: queries ALL loaded projects, output is keyed by project
+           id ({project_id: [objects]}) with empty projects omitted. Feeds the
+           `json` subcommand, which replicates every project's membership.
     """
     config = MstrConfig(environment=MstrEnvironment(env))
     out = output_dir or config.output_dir
@@ -564,8 +676,30 @@ def cmd_export(
             "Content group: {name} ({id})", name=cg_name, id=cg_id,
         )
 
-        # Retrieve current contents (REST API)
-        objects = _get_content_group_objects(session, cg_id, session.project_id)
+        if fmt == "json":
+            # Comprehensive: query every loaded project, keep only populated ones
+            project_ids = [p.id for p in Environment(conn).list_loaded_projects()]
+            raw = _get_content_group_contents_raw(session, cg_id, project_ids)
+            populated = {pid: objs for pid, objs in raw.items() if objs}
+            if not populated:
+                logger.warning(
+                    "Content group '{name}' has no contents in any loaded "
+                    "project. Nothing to export.", name=cg_name,
+                )
+                return
+            out_path = Path(out) / f"content_group_export_{env}.json"
+            out_path.write_text(json.dumps(populated, indent=2), encoding="utf-8")
+            total = sum(len(v) for v in populated.values())
+            logger.success(
+                "Exported {n} object(s) across {p} project(s) from content "
+                "group '{name}' to {path}",
+                n=total, p=len(populated), name=cg_name, path=out_path,
+            )
+            return
+
+        # csv — single project
+        raw = _get_content_group_contents_raw(session, cg_id, session.project_id)
+        objects = _flatten_contents(raw)
         if not objects:
             logger.warning(
                 "Content group '{name}' has no contents in project {pid}. "
@@ -574,7 +708,6 @@ def cmd_export(
             )
             return
 
-        # Write output — same schema as the add-input CSV (GUID column drives re-import)
         rows = []
         for obj in objects:
             type_name = OBJECT_TYPE_ID_MAP.get(obj["type"], str(obj["type"]))
@@ -582,7 +715,6 @@ def cmd_export(
                 obj["id"], obj["name"], type_name, obj["type"],
                 "ContentGroup", "EXPORTED",
             ])
-
         out_path = Path(out) / f"content_group_export_{env}.csv"
         write_csv(rows, columns=_OUTPUT_COLS, path=out_path)
         logger.success(
@@ -660,12 +792,34 @@ if __name__ == "__main__":
         help="Folder GUID to read objects from.",
     )
 
+    # ── json ──────────────────────────────────────────────────────────────
+    p_json = subparsers.add_parser(
+        "json",
+        help="Add objects from a project-keyed JSON file (projects from the file).",
+    )
+    _add_common_args(p_json)
+    p_json.add_argument(
+        "--json",
+        required=True,
+        dest="json_path",
+        metavar="PATH",
+        help="Path to a project-keyed JSON file ({project_id: [objects]}).",
+    )
+
     # ── export ────────────────────────────────────────────────────────────
     p_export = subparsers.add_parser(
         "export",
-        help="Export a content group's contents to a re-importable CSV.",
+        help="Export a content group's contents to a re-importable CSV or JSON.",
     )
     _add_common_args(p_export, include_apply=False)  # read-only, no --apply
+    p_export.add_argument(
+        "--format",
+        choices=["csv", "json"],
+        default="csv",
+        dest="fmt",
+        help="Output format. csv = single project (flat); "
+             "json = all loaded projects, keyed by project id (default: csv).",
+    )
 
     # ── Dispatch ──────────────────────────────────────────────────────────
     args = parser.parse_args()
@@ -688,10 +842,19 @@ if __name__ == "__main__":
             apply=args.apply,
             output_dir=args.output_dir,
         )
+    elif args.subcommand == "json":
+        cmd_json(
+            env=args.env,
+            content_group=args.content_group,
+            json_path=args.json_path,
+            apply=args.apply,
+            output_dir=args.output_dir,
+        )
     elif args.subcommand == "export":
         cmd_export(
             env=args.env,
             content_group=args.content_group,
             project=args.project,
             output_dir=args.output_dir,
+            fmt=args.fmt,
         )
