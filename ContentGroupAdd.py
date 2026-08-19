@@ -229,7 +229,7 @@ def _get_folder_objects(session, folder_id):
 
         # Resolve shortcuts to their target
         if obj_type == _SHORTCUT_TYPE:
-            target = _resolve_shortcut(session, item["id"])
+            target = _resolve_shortcut(session, item["id"], item.get("name", ""))
             if target:
                 resolved_shortcuts += 1
                 logger.debug(
@@ -240,11 +240,7 @@ def _get_folder_objects(session, folder_id):
                     ttype=target.get("type"),
                 )
                 results.append(target)
-            else:
-                logger.warning(
-                    "Could not resolve shortcut: {name} ({id})",
-                    name=item.get("name"), id=item.get("id"),
-                )
+            # _resolve_shortcut logs the specific reason on failure.
             continue
 
         results.append({
@@ -265,25 +261,44 @@ def _get_folder_objects(session, folder_id):
     return results
 
 
-def _resolve_shortcut(session, shortcut_id):
+def _resolve_shortcut(session, shortcut_id, fallback_name=""):
     """
-    Resolve a shortcut to its target object.
+    Resolve a shortcut (type 18) to its target object.
 
-    Returns a dict with 'id', 'name', 'type' of the target, or None on failure.
+    ``GET /objects/{id}?type=18`` returns the shortcut's object info; the
+    target's metadata lives under the ``targetInfo`` key (mstrio maps this to
+    ``target_info``). Some server versions may instead use ``target`` — both
+    are handled.
+
+    Returns a dict with 'id', 'name', 'type' of the target, or None when the
+    lookup fails or no target is present (e.g. a dangling shortcut whose target
+    was deleted). The reason is logged so folder runs are diagnosable.
     """
     r = session.get(f"/objects/{shortcut_id}?type={_SHORTCUT_TYPE}")
     if not r.ok:
+        logger.warning(
+            "Could not resolve shortcut '{name}' ({id}): "
+            "object lookup failed HTTP {status} — {body}",
+            name=fallback_name, id=shortcut_id,
+            status=r.status_code, body=r.text[:300],
+        )
         return None
 
     data = r.json()
-    target = data.get("target")
-    if target:
-        return {
-            "id": target["id"],
-            "name": target.get("name", ""),
-            "type": target.get("type", 0),
-        }
-    return None
+    target = data.get("targetInfo") or data.get("target")
+    if not target or not target.get("id"):
+        logger.warning(
+            "Could not resolve shortcut '{name}' ({id}): no target in response "
+            "(response keys: {keys}) — possibly a dangling shortcut",
+            name=fallback_name, id=shortcut_id, keys=sorted(data.keys()),
+        )
+        return None
+
+    return {
+        "id": target["id"],
+        "name": target.get("name") or fallback_name,
+        "type": target.get("type", 0),
+    }
 
 
 def _read_contents_json(json_path):
