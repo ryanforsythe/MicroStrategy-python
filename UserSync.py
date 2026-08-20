@@ -4,10 +4,12 @@ Two-phase, audit-driven user migration between two MicroStrategy environments
 (dev / qa / prod):
 
     1. audit   — Compare the members of a base user group in the SOURCE
-                 environment against a group in the TARGET environment,
-                 recursing through every sub user group. Each source user is
+                 environment (recursing through every sub user group) against
+                 EVERY user in the TARGET environment. Each source user is
                  matched against the target on BOTH GUID and login (GUID first,
-                 then login). A user is flagged as a diff when it is:
+                 then login) — a login that exists anywhere in the target env
+                 counts as a match, not only inside a target group. A user is
+                 flagged as a diff when it is:
                    * MISSING_IN_TARGET     — found by neither GUID nor login;
                    * LOGIN_MATCH_DIFF_GUID — login exists in target but under a
                                              different GUID (a GUID-keyed package
@@ -51,7 +53,7 @@ Usage
 -----
     # Phase 1 — produce the audit file (read-only; always writes the xlsx)
     python UserSync.py audit <source_env> <target_env> \
-        --source-group "Finance Users" [--target-group "Finance Users"] \
+        --source-group "Finance Users" \
         [--output-dir PATH] [--concurrency N]
 
     # Phase 2 — build the .mmp from the (reviewed) audit file
@@ -59,8 +61,7 @@ Usage
         [--output-dir PATH] [--action replace|use_newer|force_replace]
 
 `package` is dry-run by default (lists what would be included); pass --apply to
-create and download the .mmp. `--target-group` defaults to `--source-group`
-when the group carries the same name/GUID in both environments.
+create and download the .mmp.
 
 Audit columns
 -------------
@@ -97,7 +98,7 @@ from mstrio.object_management.migration import (
     PackageSettings,
 )
 from mstrio.types import ObjectTypes
-from mstrio.users_and_groups import User, UserGroup
+from mstrio.users_and_groups import User, UserGroup, list_users
 
 from mstrio_core import MstrConfig, get_mstrio_connection, read_excel, write_excel
 from mstrio_core.config import MstrEnvironment
@@ -299,6 +300,34 @@ def _index_by_login(users_by_id: dict) -> dict:
     return by_login
 
 
+def _collect_env_users(conn, label: str) -> dict:
+    """Load EVERY user in the environment, keyed by GUID.
+
+    Used for the TARGET side so a source user counts as a match when its GUID or
+    login exists anywhere in the target environment — not only inside the target
+    group. `list_users()` populates id / name / username cheaply in one paginated
+    call; `date_modified` / `date_created` are left None here and filled lazily
+    only for the users that GUID-match a source user (see cmd_audit).
+    """
+    users = list_users(conn)
+    by_id: dict = {}
+    for u in users:
+        uid = getattr(u, "id", None)
+        if not uid:
+            continue
+        by_id[uid] = {
+            "id": uid,
+            "name": getattr(u, "name", "") or "",
+            "username": (getattr(u, "username", "") or ""),
+            "date_modified": None,   # filled lazily for GUID matches
+            "date_created": None,
+            "enabled": getattr(u, "enabled", None),
+        }
+    logger.success("[{label}] Loaded {n} user(s) from the target environment.",
+                   label=label, n=len(by_id))
+    return by_id
+
+
 # ── Phase 1: audit ───────────────────────────────────────────────────────────
 
 
@@ -306,13 +335,16 @@ def cmd_audit(
     source_env: str,
     target_env: str,
     source_group: str,
-    target_group: Optional[str],
     output_dir: Optional[Path],
     concurrency: int,
 ) -> Path:
-    """Compare source vs target group trees and write the diff audit .xlsx."""
-    target_group = target_group or source_group
+    """Compare the source group tree against the whole target env; write the
+    diff audit .xlsx.
 
+    Source users come from the source group tree; the target comparison set is
+    EVERY user in the target environment, so a login/GUID that exists anywhere
+    in target counts as a match (not just inside a target group).
+    """
     src_config = MstrConfig(environment=MstrEnvironment(source_env))
     tgt_config = MstrConfig(environment=MstrEnvironment(target_env))
     out_dir = output_dir or src_config.output_dir
@@ -322,7 +354,24 @@ def cmd_audit(
     tgt_conn = get_mstrio_connection(config=tgt_config)
     try:
         source_users = _collect_users(src_conn, source_group, concurrency, "SOURCE")
-        target_users = _collect_users(tgt_conn, target_group, concurrency, "TARGET")
+        target_users = _collect_env_users(tgt_conn, "TARGET")
+
+        # Fill date_modified/date_created only for target users that GUID-match a
+        # source user (the only case where the timestamps drive the diff).
+        guid_matches = [uid for uid in source_users if uid in target_users]
+        if guid_matches:
+            logger.info("Fetching timestamps for {n} GUID-matched target user(s).",
+                        n=len(guid_matches))
+            with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+                futures = {pool.submit(_fetch_user_meta, tgt_conn, uid): uid
+                           for uid in guid_matches}
+                for fut in as_completed(futures):
+                    uid = futures[fut]
+                    try:
+                        target_users[uid] = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("Could not fetch target user {uid}: {err}",
+                                       uid=uid, err=exc)
     finally:
         for c in (src_conn, tgt_conn):
             try:
@@ -563,10 +612,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_audit.add_argument("source_env", choices=ENVS, help="Source environment.")
     p_audit.add_argument("target_env", choices=ENVS, help="Target environment.")
     p_audit.add_argument("--source-group", required=True,
-                         help="Base user group in the source env (name or GUID).")
-    p_audit.add_argument("--target-group", default=None,
-                         help="Group in the target env (name or GUID). "
-                              "Defaults to --source-group.")
+                         help="Base user group in the source env (name or GUID). "
+                              "The target comparison set is every user in the "
+                              "target environment (no target group needed).")
     p_audit.add_argument("--concurrency", type=int, default=10,
                          help="Parallel user fetches per environment (default 10).")
     p_audit.add_argument("--output-dir", type=Path, default=None, metavar="PATH",
@@ -600,7 +648,6 @@ def main(argv: Optional[list] = None) -> int:
             source_env=args.source_env,
             target_env=args.target_env,
             source_group=args.source_group,
-            target_group=args.target_group,
             output_dir=args.output_dir,
             concurrency=args.concurrency,
         )
