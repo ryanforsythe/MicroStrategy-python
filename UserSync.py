@@ -58,9 +58,11 @@ when the group carries the same name/GUID in both environments.
 
 Audit columns
 -------------
-    GUID, Name, Login, Last Modified Time, Created Time, Status, Target Action,
-    Target Last Modified Time, Target GUID
-    (GUID/Name/Login/times describe the SOURCE user; the package matches on GUID)
+    GUID, Name, Login, Last Modified Time, Created Time, Status, Diff Reason,
+    Target Action, Target Last Modified Time, Target GUID
+    (GUID/Name/Login/times/Status describe the SOURCE user; Status is the account
+    state Enabled/Disabled; Diff Reason is MISSING_IN_TARGET or SOURCE_NEWER; the
+    package matches on GUID)
 
 mstrio-py used
 --------------
@@ -103,7 +105,8 @@ AUDIT_COLUMNS = [
     "Login",
     "Last Modified Time",         # source
     "Created Time",               # source
-    "Status",
+    "Status",                     # source user account: Enabled / Disabled
+    "Diff Reason",                # why the user is in the diff (see STATUS_* below)
     "Target Action",              # editable gate: "Update" = include, else exclude
     "Target Last Modified Time",  # context for the reviewer
     "Target GUID",                # context (usually equals GUID on cloned envs)
@@ -143,6 +146,15 @@ def _resolve_group(conn, identifier: str) -> UserGroup:
     if _is_guid(identifier):
         return UserGroup(conn, id=identifier)
     return UserGroup(conn, name=identifier)
+
+
+def _enabled_label(enabled) -> str:
+    """Map a user's `enabled` flag to a display label for the Status column."""
+    if enabled is True:
+        return "Enabled"
+    if enabled is False:
+        return "Disabled"
+    return ""  # unknown / not reported
 
 
 def _fmt_dt(value) -> str:
@@ -308,14 +320,14 @@ def cmd_audit(
         src_mod = _as_datetime(src["date_modified"])
 
         if tgt is None:
-            status = STATUS_MISSING
+            diff_reason = STATUS_MISSING
             n_missing += 1
             tgt_mod_display, tgt_guid = "", ""
         else:
             tgt_mod = _as_datetime(tgt["date_modified"])
             # Diff only when the source copy is strictly newer than the target.
             if src_mod is not None and (tgt_mod is None or src_mod > tgt_mod):
-                status = STATUS_NEWER
+                diff_reason = STATUS_NEWER
                 n_newer += 1
                 tgt_mod_display = _fmt_dt(tgt["date_modified"])
                 tgt_guid = tgt["id"]
@@ -328,14 +340,16 @@ def cmd_audit(
             src["username"],
             _fmt_dt(src["date_modified"]),
             _fmt_dt(src["date_created"]),
-            status,
+            _enabled_label(src["enabled"]),
+            diff_reason,
             DEFAULT_TARGET_ACTION,
             tgt_mod_display,
             tgt_guid,
         ])
 
     # Stable, reviewer-friendly ordering: missing first, then newest source edits.
-    rows.sort(key=lambda r: (r[5] != STATUS_MISSING, r[3]), reverse=False)
+    # (col 6 = Diff Reason, col 3 = Last Modified Time)
+    rows.sort(key=lambda r: (r[6] != STATUS_MISSING, r[3]), reverse=False)
 
     write_excel(rows, path=out_path, columns=AUDIT_COLUMNS, sheet_name="UserSync")
     logger.success(
