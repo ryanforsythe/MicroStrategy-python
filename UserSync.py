@@ -5,11 +5,17 @@ Two-phase, audit-driven user migration between two MicroStrategy environments
 
     1. audit   — Compare the members of a base user group in the SOURCE
                  environment against a group in the TARGET environment,
-                 recursing through every sub user group. A user is flagged as a
-                 diff when it is missing in the target, or when its source
-                 Last-Modified time is newer than the target's. The diff is
-                 written to an .xlsx audit file, one row per user, with a
-                 `Target Action` column defaulting to "Update".
+                 recursing through every sub user group. Each source user is
+                 matched against the target on BOTH GUID and login (GUID first,
+                 then login). A user is flagged as a diff when it is:
+                   * MISSING_IN_TARGET     — found by neither GUID nor login;
+                   * LOGIN_MATCH_DIFF_GUID — login exists in target but under a
+                                             different GUID (a GUID-keyed package
+                                             would not update it);
+                   * SOURCE_NEWER          — matched by GUID and the source
+                                             Last-Modified is newer.
+                 The diff is written to an .xlsx audit file, one row per user,
+                 with a `Target Action` column defaulting to "Update".
 
     2. package — Read that audit file, keep only rows whose `Target Action` is
                  still "Update" (any other value excludes the row), and build a
@@ -61,8 +67,9 @@ Audit columns
     GUID, Name, Login, Last Modified Time, Created Time, Status, Diff Reason,
     Target Action, Target Last Modified Time, Target GUID
     (GUID/Name/Login/times/Status describe the SOURCE user; Status is the account
-    state Enabled/Disabled; Diff Reason is MISSING_IN_TARGET or SOURCE_NEWER; the
-    package matches on GUID)
+    state Enabled/Disabled; Diff Reason is MISSING_IN_TARGET, LOGIN_MATCH_DIFF_GUID,
+    or SOURCE_NEWER; Target GUID is the matched target user's GUID — equal to GUID
+    on a GUID match, different on a login match; the package matches on GUID)
 
 mstrio-py used
 --------------
@@ -115,9 +122,10 @@ AUDIT_COLUMNS = [
 DEFAULT_TARGET_ACTION = "Update"
 INCLUDE_ACTION = "update"         # compared case-insensitively against Target Action
 
-# Status classifications (only diffs are written to the audit file)
-STATUS_MISSING = "MISSING_IN_TARGET"
-STATUS_NEWER = "SOURCE_NEWER"
+# Diff-reason classifications (only diffs are written to the audit file)
+STATUS_MISSING = "MISSING_IN_TARGET"       # not found by GUID or login
+STATUS_NEWER = "SOURCE_NEWER"              # matched, source modified more recently
+STATUS_GUID_MISMATCH = "LOGIN_MATCH_DIFF_GUID"  # login exists in target, GUID differs
 
 # Per-object action in the package. The audit already narrowed the set to users
 # that need updating, so REPLACE is the sensible default; the package-level
@@ -247,10 +255,10 @@ def _fetch_user_meta(conn, user_id: str) -> dict:
 
 
 def _collect_users(conn, group_identifier: str, concurrency: int, label: str) -> dict:
-    """Expand a group tree and return {match_key: meta} for all member users.
+    """Expand a group tree and return {user_id: meta} for all member users.
 
-    match_key is the lowercased login (username); users without a login fall
-    back to a GUID-based key so they can still surface in the audit.
+    Keyed by the user's own GUID; each meta also carries `username`, so callers
+    can build secondary indexes (by login) for cross-environment matching.
     """
     group = _resolve_group(conn, group_identifier)
     logger.info("[{label}] Resolving group '{grp}' → {gid} ({name})",
@@ -260,9 +268,9 @@ def _collect_users(conn, group_identifier: str, concurrency: int, label: str) ->
     logger.info("[{label}] {n} distinct member user(s) across the group tree.",
                 label=label, n=len(user_ids))
 
-    by_key: dict = {}
+    by_id: dict = {}
     if not user_ids:
-        return by_key
+        return by_id
 
     with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
         futures = {pool.submit(_fetch_user_meta, conn, uid): uid for uid in user_ids}
@@ -274,12 +282,21 @@ def _collect_users(conn, group_identifier: str, concurrency: int, label: str) ->
                 logger.warning("[{label}] Could not fetch user {uid}: {err}",
                                label=label, uid=uid, err=exc)
                 continue
-            login = meta["username"].strip().lower()
-            key = login if login else f"guid:{meta['id']}"
-            by_key[key] = meta
+            by_id[meta["id"]] = meta
 
-    logger.success("[{label}] Loaded metadata for {n} user(s).", label=label, n=len(by_key))
-    return by_key
+    logger.success("[{label}] Loaded metadata for {n} user(s).", label=label, n=len(by_id))
+    return by_id
+
+
+def _index_by_login(users_by_id: dict) -> dict:
+    """Build a {login_lower: meta} index from an id-keyed user map (users with a
+    login only; first occurrence wins on the rare duplicate login)."""
+    by_login: dict = {}
+    for meta in users_by_id.values():
+        login = (meta.get("username") or "").strip().lower()
+        if login:
+            by_login.setdefault(login, meta)
+    return by_login
 
 
 # ── Phase 1: audit ───────────────────────────────────────────────────────────
@@ -313,26 +330,41 @@ def cmd_audit(
             except Exception:  # noqa: BLE001
                 pass
 
+    # Match on BOTH GUID and login: try the GUID first, then fall back to login.
+    # A login hit in the target counts as a match and supplies the Target GUID
+    # (which will differ from the source GUID — surfaced as LOGIN_MATCH_DIFF_GUID).
+    target_by_guid = target_users
+    target_by_login = _index_by_login(target_users)
+
     rows: list[list] = []
-    n_missing = n_newer = 0
-    for key, src in source_users.items():
-        tgt = target_users.get(key)
+    n_missing = n_newer = n_guid_mismatch = 0
+    for src_id, src in source_users.items():
+        src_login = (src["username"] or "").strip().lower()
         src_mod = _as_datetime(src["date_modified"])
+
+        tgt = target_by_guid.get(src_id)
+        if tgt is None and src_login:
+            tgt = target_by_login.get(src_login)
 
         if tgt is None:
             diff_reason = STATUS_MISSING
             n_missing += 1
             tgt_mod_display, tgt_guid = "", ""
         else:
+            tgt_guid = tgt["id"]
             tgt_mod = _as_datetime(tgt["date_modified"])
-            # Diff only when the source copy is strictly newer than the target.
-            if src_mod is not None and (tgt_mod is None or src_mod > tgt_mod):
+            tgt_mod_display = _fmt_dt(tgt["date_modified"])
+
+            if tgt_guid != src_id:
+                # Matched by login, but the target user carries a different GUID —
+                # a GUID-keyed package won't update it, so always surface this.
+                diff_reason = STATUS_GUID_MISMATCH
+                n_guid_mismatch += 1
+            elif src_mod is not None and (tgt_mod is None or src_mod > tgt_mod):
                 diff_reason = STATUS_NEWER
                 n_newer += 1
-                tgt_mod_display = _fmt_dt(tgt["date_modified"])
-                tgt_guid = tgt["id"]
             else:
-                continue  # in sync (target same or newer) — not a diff
+                continue  # matched by GUID and target is same/newer — in sync
 
         rows.append([
             src["id"],
@@ -354,8 +386,9 @@ def cmd_audit(
     write_excel(rows, path=out_path, columns=AUDIT_COLUMNS, sheet_name="UserSync")
     logger.success(
         "Audit complete: {total} diff user(s) — {miss} missing in target, "
-        "{newer} newer in source → {path}",
-        total=len(rows), miss=n_missing, newer=n_newer, path=out_path,
+        "{newer} newer in source, {gmm} login-match/different-GUID → {path}",
+        total=len(rows), miss=n_missing, newer=n_newer,
+        gmm=n_guid_mismatch, path=out_path,
     )
     if not rows:
         logger.info("No differences found — source group tree is in sync with target.")
