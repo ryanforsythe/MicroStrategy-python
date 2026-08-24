@@ -426,8 +426,15 @@ def _update_user(tgt_conn, user, src, target_group_ids, apply: bool) -> str:
         alter_kwargs["full_name"] = src_display
     if is_email and (getattr(user, "trust_id", None) or "") != login:
         alter_kwargs["trust_id"] = login
-    if not is_agdata and getattr(user, "password_modifiable", None) is not False:
+    if not is_agdata and (
+            getattr(user, "password_modifiable", None) is not False
+            or getattr(user, "password_auto_expire", None) is not False
+            or getattr(user, "require_new_password", None) is not False):
+        # password_modifiable=False conflicts with auto-expire / require-new-password;
+        # the server rejects the combination, so disable all three together.
         alter_kwargs["password_modifiable"] = False
+        alter_kwargs["password_auto_expire"] = False
+        alter_kwargs["require_new_password"] = False
 
     # Ensure a default email address exists (add, never alter) for '@' logins.
     needs_default_email = is_email and not getattr(user, "default_email_address", None)
@@ -499,6 +506,9 @@ def _apply_one(tgt_conn, src, target_index, target_group_ids, apply: bool) -> di
                 standard_auth=False,
                 require_new_password=False,
                 password_modifiable=(False if not is_agdata else True),
+                # non-agdata users get password_modifiable=False, which requires
+                # auto-expire off (server rejects the combination otherwise).
+                password_auto_expire=(False if not is_agdata else None),
                 trust_id=(login if is_email else None),
                 memberships=sorted(desired_gids) or None,
                 default_email_address=(login if is_email else None),
