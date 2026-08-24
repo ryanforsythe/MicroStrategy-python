@@ -57,6 +57,7 @@ mstrio-py used
 from __future__ import annotations
 
 import argparse
+import re
 import secrets
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -399,6 +400,59 @@ def _desired_target_group_ids(src_groups: dict, target_group_ids: set, login: st
     return desired
 
 
+_COLLISION_ID_RE = re.compile(r"with ID ([0-9A-Fa-f]{32})")
+
+
+def _update_user(tgt_conn, user, src, target_group_ids, apply: bool) -> str:
+    """Reconcile an existing target `user` to match `src`. Returns a details str.
+
+    Note: `default_email_address` is NOT passed to alter() — mstrio's alter only
+    EDITS an existing default address and raises when none exists, so a missing
+    default email is created via add_address() instead.
+    """
+    login = (src["username"] or "").strip()
+    is_email = _is_email(login)
+    is_agdata = _is_agdata(login)
+    src_groups = _membership_index(src["memberships"])
+    desired_gids = _desired_target_group_ids(src_groups, target_group_ids, login)
+
+    alter_kwargs = {"standard_auth": False}
+    if user.enabled != bool(src["enabled"]):
+        alter_kwargs["enabled"] = bool(src["enabled"])
+    # Sync the display name from source (carries any "- Disabled <date>" suffix).
+    src_display = src["full_name"] or src["name"]
+    tgt_display = (getattr(user, "full_name", "") or getattr(user, "name", "") or "")
+    if src_display and src_display != tgt_display:
+        alter_kwargs["full_name"] = src_display
+    if is_email and (getattr(user, "trust_id", None) or "") != login:
+        alter_kwargs["trust_id"] = login
+    if not is_agdata and getattr(user, "password_modifiable", None) is not False:
+        alter_kwargs["password_modifiable"] = False
+
+    # Ensure a default email address exists (add, never alter) for '@' logins.
+    needs_default_email = is_email and not getattr(user, "default_email_address", None)
+
+    current_gids = set(_membership_index(
+        _normalize_memberships(getattr(user, "memberships", []) or [])))
+    to_add = desired_gids - current_gids
+    to_remove = current_gids - desired_gids
+
+    details = (f"alter={sorted(alter_kwargs)}"
+               + ("; +default_email" if needs_default_email else "")
+               + f"; groups +{len(to_add)}/-{len(to_remove)}")
+
+    if apply:
+        user.alter(**alter_kwargs)  # always at least enforces standard_auth=False
+        if needs_default_email:
+            user.add_address(name="Default Email", address=login, default=True,
+                             delivery_type="email", device_id=GENERIC_EMAIL_DEVICE_ID)
+        for gid in to_add:
+            UserGroup(tgt_conn, id=gid).add_users([user])
+        for gid in to_remove:
+            UserGroup(tgt_conn, id=gid).remove_users([user])
+    return details
+
+
 def _apply_one(tgt_conn, src, target_index, target_group_ids, apply: bool) -> dict:
     """Create or update one target user to match the source. Returns a result dict."""
     login = (src["username"] or "").strip()
@@ -413,69 +467,61 @@ def _apply_one(tgt_conn, src, target_index, target_group_ids, apply: bool) -> di
     exists_id = target_index.get(login_l)
 
     try:
-        if exists_id is None:
-            # ---- CREATE ----
-            result["action"] = "create"
-            details = [
-                f"enabled={src['enabled']}", "standard_auth=False",
-                f"groups=+{len(desired_gids)}",
-            ]
-            if is_email:
-                details.append("trust_id=login")
-                details.append("default_email=login")
-            if not is_agdata:
-                details.append("password_modifiable=False")
-            result["details"] = "; ".join(details)
-
-            if apply:
-                User.create(
-                    connection=tgt_conn,
-                    username=login,
-                    full_name=full_name,
-                    password=secrets.token_urlsafe(16),  # unusable: standard_auth off
-                    enabled=bool(src["enabled"]),
-                    standard_auth=False,
-                    require_new_password=False,
-                    password_modifiable=(False if not is_agdata else True),
-                    trust_id=(login if is_email else None),
-                    memberships=sorted(desired_gids) or None,
-                    default_email_address=(login if is_email else None),
-                    email_device=(GENERIC_EMAIL_DEVICE_ID if is_email else None),
-                )
-            result["status"] = "created" if apply else "dry-run"
-        else:
-            # ---- UPDATE ----
+        if exists_id is not None:
+            # ---- UPDATE (matched by login) ----
             result["action"] = "update"
             user = User(tgt_conn, id=exists_id)
-
-            alter_kwargs = {"standard_auth": False}
-            if user.enabled != bool(src["enabled"]):
-                alter_kwargs["enabled"] = bool(src["enabled"])
-            if is_email and (getattr(user, "trust_id", None) or "") != login:
-                alter_kwargs["trust_id"] = login
-            if not is_agdata and getattr(user, "password_modifiable", None) is not False:
-                alter_kwargs["password_modifiable"] = False
-            if is_email and not getattr(user, "default_email_address", None):
-                alter_kwargs["default_email_address"] = login
-                alter_kwargs["email_device"] = GENERIC_EMAIL_DEVICE_ID
-
-            # Membership diff (Everyone already excluded from both sides)
-            current_gids = set(_membership_index(
-                _normalize_memberships(getattr(user, "memberships", []) or [])))
-            to_add = desired_gids - current_gids
-            to_remove = current_gids - desired_gids
-
-            result["details"] = (
-                f"alter={sorted(k for k in alter_kwargs)}; "
-                f"groups +{len(to_add)}/-{len(to_remove)}")
-
-            if apply:
-                user.alter(**alter_kwargs)  # always at least enforces standard_auth=False
-                for gid in to_add:
-                    UserGroup(tgt_conn, id=gid).add_users([user])
-                for gid in to_remove:
-                    UserGroup(tgt_conn, id=gid).remove_users([user])
+            result["details"] = _update_user(tgt_conn, user, src, target_group_ids, apply)
             result["status"] = "updated" if apply else "dry-run"
+            return result
+
+        # ---- CREATE ----
+        result["action"] = "create"
+        details = [f"enabled={src['enabled']}", "standard_auth=False",
+                   f"groups=+{len(desired_gids)}"]
+        if is_email:
+            details += ["trust_id=login", "default_email=login"]
+        if not is_agdata:
+            details.append("password_modifiable=False")
+        result["details"] = "; ".join(details)
+
+        if not apply:
+            result["status"] = "dry-run"
+            return result
+
+        try:
+            User.create(
+                connection=tgt_conn,
+                username=login,
+                full_name=full_name,
+                password=secrets.token_urlsafe(16),  # unusable: standard_auth off
+                enabled=bool(src["enabled"]),
+                standard_auth=False,
+                require_new_password=False,
+                password_modifiable=(False if not is_agdata else True),
+                trust_id=(login if is_email else None),
+                memberships=sorted(desired_gids) or None,
+                default_email_address=(login if is_email else None),
+                email_device=(GENERIC_EMAIL_DEVICE_ID if is_email else None),
+            )
+            result["status"] = "created"
+        except Exception as create_exc:  # noqa: BLE001
+            # The identity (trust_id/username) already exists under a DIFFERENT
+            # username, so the login match missed it. Recover the colliding user
+            # id from the error and update that account instead of creating a dup.
+            m = _COLLISION_ID_RE.search(str(create_exc))
+            if not m:
+                raise
+            other_id = m.group(1)
+            logger.warning("Create '{login}' collided with existing user {oid} "
+                           "(same identity, different username) — updating instead.",
+                           login=login, oid=other_id)
+            user = User(tgt_conn, id=other_id)
+            result["action"] = "update"
+            result["details"] = ("converted-from-create; "
+                                 + _update_user(tgt_conn, user, src, target_group_ids, apply))
+            result["status"] = "updated"
+        return result
     except Exception as exc:  # noqa: BLE001
         result["status"] = "error"
         result["details"] = f"{result.get('details','')} | ERROR: {exc}"
