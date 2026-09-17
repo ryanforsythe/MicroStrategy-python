@@ -1,7 +1,9 @@
 """LibraryBookmarks — export Library bookmarks for a project with the REST API only.
 
-No mstrio-py: plain `requests` calls, so every endpoint, parameter and error is
-visible in this file and in the log.
+Every API call is a plain `requests` call, so every endpoint, parameter and error is
+visible in this file and in the log — no mstrio-py in the API path. Configuration and
+logging come from `mstrio_core.config` like the other CLI scripts, which does import
+mstrio-py by way of the package's __init__.
 
 What the API allows
 -------------------
@@ -36,11 +38,11 @@ which cannot filter hidden objects.
 
 Credentials
 -----------
-From the environment, following the repo's prefix chain
-MSTR_{ENV}_{VAR} -> MSTR_{VAR}: MSTR_BASE_URL, MSTR_USERNAME, MSTR_PASSWORD,
-MSTR_LOGIN_MODE (default 1), MSTR_SSL_VERIFY. `--username` overrides the login and
-prompts for the password unless MSTR_OTHER_PASSWORD is set. Nothing is written to
-disk except the export.
+`MstrConfig` reads the .env file and the environment with the repo's prefix chain
+MSTR_{ENV}_{VAR} -> MSTR_{VAR}: BASE_URL, USERNAME, PASSWORD (or the OS keyring),
+LOGIN_MODE (default 1), SSL_VERIFY, OUTPUT_DIR, LOG_DIR, LOG_LEVEL. `--username`
+overrides the login and prompts for that user's password unless MSTR_OTHER_PASSWORD
+is set. Nothing is written to disk except the export and the usual log file.
 
 Usage
 -----
@@ -63,6 +65,8 @@ import requests
 import urllib3
 from loguru import logger
 
+from mstrio_core import MstrConfig, MstrEnvironment
+
 LIBRARY_SHORTCUT_SUBTYPE = 4609   # ObjectSubTypes.LIBRARY_SHORTCUT
 SEARCH_DOMAIN_PROJECT = 2         # SearchDomain.PROJECT
 SEARCH_PATTERN_CONTAINS = 4       # SearchPattern.CONTAINS
@@ -74,28 +78,6 @@ COLUMNS = ["project_id", "project_name", "owner_id", "owner_name", "shortcut_id"
            "shortcut_name", "target_id", "target_name", "bookmark_id", "bookmark_name",
            "version", "creation_time", "last_update_time", "last_view_time",
            "status", "status_details"]
-
-
-def setup_logging(level="INFO"):
-    logger.remove()
-    logger.add(lambda message: sys.stdout.write(message), colorize=False, level=level,
-               format="{time:YYYY-MM-DD HH:mm:ss.SSS ZZ} | {level: <8} | {message}")
-
-
-# --- Environment -------------------------------------------------------------------
-
-
-def env_value(env, name, default=None):
-    """MSTR_{ENV}_{NAME} -> MSTR_{NAME} -> default (the repo's prefix chain)."""
-    for key in (f"MSTR_{env.upper()}_{name}", f"MSTR_{name}"):
-        value = os.environ.get(key)
-        if value not in (None, ""):
-            return value
-    return default
-
-
-def ssl_verify(env):
-    return str(env_value(env, "SSL_VERIFY", "true")).strip().lower() not in ("false", "0", "no")
 
 
 # --- Session -----------------------------------------------------------------------
@@ -353,38 +335,40 @@ def parse_args(argv=None):
     parser.add_argument("--format", choices=("csv", "json"), default="csv")
     parser.add_argument("--output-dir", help="default: MSTR_OUTPUT_DIR or c:/tmp")
     parser.add_argument("--concurrency", type=int, default=10)
-    parser.add_argument("--log-level", default="INFO")
+    parser.add_argument("--log-level", help="default: MSTR_LOG_LEVEL or INFO")
     return parser.parse_args(argv)
 
 
-def credentials(args):
-    """(base_url, username, password, login_mode) for this run."""
-    base_url = env_value(args.env, "BASE_URL")
-    if not base_url:
-        raise RuntimeError(f"Set MSTR_{args.env.upper()}_BASE_URL or MSTR_BASE_URL.")
-    login_mode = env_value(args.env, "LOGIN_MODE", 1)
+def load_config(args):
+    """MstrConfig for this run: .env + MSTR_{ENV}_* variables, keyring, logging.
+
+    `--username` bypasses the configured login so one user's bookmarks can be
+    collected; their password is prompted for, or read from MSTR_OTHER_PASSWORD.
+    """
+    try:
+        environment = MstrEnvironment(args.env.strip().lower())
+    except ValueError:
+        valid = ", ".join(e.value for e in MstrEnvironment)
+        raise RuntimeError(f"Unknown environment {args.env!r}. Use one of: {valid}.") from None
+    overrides = {}
+    if args.log_level:
+        overrides["log_level"] = args.log_level.upper()
     if args.username:
-        password = os.environ.get("MSTR_OTHER_PASSWORD") or getpass(
-            f"Password for {args.username}: ")
-        return base_url, args.username, password, login_mode
-    username = env_value(args.env, "USERNAME")
-    password = env_value(args.env, "PASSWORD")
-    if not (username and password):
-        raise RuntimeError(f"Set MSTR_{args.env.upper()}_USERNAME and _PASSWORD "
-                           f"(or MSTR_USERNAME / MSTR_PASSWORD), or pass --username.")
-    return base_url, username, password, login_mode
+        overrides["username"] = args.username
+        overrides["password"] = (os.environ.get("MSTR_OTHER_PASSWORD")
+                                 or getpass(f"Password for {args.username}: "))
+    return MstrConfig(environment=environment, **overrides)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    setup_logging(args.log_level)
-    base_url, username, password, login_mode = credentials(args)
-    verify = ssl_verify(args.env)
-    if not verify:
+    config = load_config(args)
+    logger.info("Environment {env}: {url}", env=config.environment.value, url=config.base_url)
+    if not config.ssl_verify:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    session = LibrarySession(base_url, verify=verify)
-    session.login(username, password, login_mode)
+    session = LibrarySession(config.base_url, verify=config.ssl_verify)
+    session.login(config.username, config.password, int(config.login_mode))
     try:
         project = session.project(args.project)
         logger.info("Project {name} ({id})", name=project["name"], id=project["id"])
@@ -397,8 +381,8 @@ def main(argv=None):
     summarize(rows)
     if args.bookmarks_only:
         rows = [r for r in rows if r["status"] == "ok"]
-    out_dir = Path(args.output_dir or env_value(args.env, "OUTPUT_DIR", "c:/tmp"))
-    safe_user = "".join(c if c.isalnum() or c in "-._" else "_" for c in username)
+    out_dir = Path(args.output_dir) if args.output_dir else config.output_dir
+    safe_user = "".join(c if c.isalnum() or c in "-._" else "_" for c in config.username)
     path = out_dir / f"library_bookmarks_{args.env}_{safe_user}.{args.format}"
     write_rows(rows, path, args.format)
     return 0
