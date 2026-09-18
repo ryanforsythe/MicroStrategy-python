@@ -111,8 +111,10 @@ class MstrConfig:
 
     # Determines which MSTR_{ENV}_* prefix is used for all other fields.
     environment: MstrEnvironment = field(
+        # `or "dev"` twice on purpose: MSTR_ENV may be unset, set but empty
+        # (e.g. a bare `MSTR_ENV=` line in .env), or whitespace only.
         default_factory=lambda: MstrEnvironment(
-            os.environ.get("MSTR_ENV", "dev").strip().lower()
+            (os.environ.get("MSTR_ENV") or "dev").strip().lower() or "dev"
         )
     )
 

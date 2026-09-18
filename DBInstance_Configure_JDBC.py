@@ -374,7 +374,8 @@ def main(
     # ── CONNECTION ─────────────────────────────────────────────────────────────
 
     # ── Option A: mstrio_core / .env (default for CLI) ────────────────────────
-    conn = get_mstrio_connection()
+    # Pass `config` so the connection uses the <env> argument, not MSTR_ENV.
+    conn = get_mstrio_connection(config=config)
 
     # ── Option B: Workstation (WORKSTATION) ───────────────────────────────────
     # Comment out Option A above and uncomment the two lines below when
