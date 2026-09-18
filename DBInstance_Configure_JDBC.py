@@ -117,6 +117,9 @@ SERVER_IP_MAP: dict[str, str] = {
     r'RDCDWPROSQL7\DW1':              '10.20.77.19',
     r'RDCMPMPROSQL1\MPM1':            '10.20.77.216',
     r'rdcspagprosql1\ebiz':           '10.20.77.139',
+    r'CDCSVDOWSTGSQL9\DAS':            '10.20.52.143',
+    r'nashkat2': '10.20.77.225',
+    r' RDCNKTPROSQL9\NKT':            '10.20.77.225',
 }
 
 _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
