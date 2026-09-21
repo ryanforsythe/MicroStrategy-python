@@ -278,30 +278,35 @@ def _expression_text(expr_obj: dict) -> str:
     return expr_obj.get("text") or ""
 
 
-def _set_expression_text(expr_obj: dict, new_text: str) -> None:
-    """
-    Update the formula text on an expression entry, leaving any existing
-    ``tokens`` and ``tree`` intact.
+# Ways to hand the server a formula it has to parse itself: the whole formula
+# as a single unprocessed ("client"-level) token. Tried in order; the first one
+# the server accepts AND reads back as the new formula is committed.
+_CLIENT_TOKEN_VARIANTS = (
+    {"type": "character", "level": "client"},
+    {"level": "client"},
+    {},
+)
 
-    Why keep the old tokens/tree?
-    ──────────────────────────────
-    The PATCH /model/attributes/{id} endpoint (ms-updateAttribute) rejects
-    expression objects that have *neither* tokens nor tree with HTTP 400
-    (error 8004ccde: "The tree or token is required for expression.").
 
-    By preserving the tokens/tree from the GET response we satisfy that
-    validation.  The changeset is opened with ``schemaEdit=true``, so at
-    commit time the I-Server re-tokenises every expression from its ``text``
-    field, replacing the stale tokens with ones that match the new formula.
-    Providing the old tokens is only a syntactic formality — they are not
-    used to infer the new expression semantics.
+def _client_token_expression(new_text: str, variant: dict) -> dict:
     """
-    e = expr_obj.get("expression")
-    if isinstance(e, dict):
-        e["text"] = new_text
-        # Intentionally NOT removing tokens/tree — see docstring above.
-    else:
-        expr_obj["expression"] = {"text": new_text}
+    An expression object carrying ``new_text`` as one client-level token.
+
+    Why tokens, not text
+    ────────────────────
+    PATCH /model/attributes/{id} rejects an expression with neither ``tokens``
+    nor ``tree`` (HTTP 400, error 8004ccde "The tree or token is required for
+    expression."). ``text`` is read-only: the server builds the expression from
+    tokens/tree and ignores it. So keeping the OLD tokens and changing ``text``
+    would save the OLD formula — which is why every PATCH is verified by reading
+    the form back before the changeset is committed.
+    """
+    return {"tokens": [{"value": new_text, **variant}]}
+
+
+def _normalized_formula(text: str) -> str:
+    """Compare formulas ignoring whitespace and case (the server re-renders them)."""
+    return "".join((text or "").split()).lower()
 
 
 def _is_html_form(form_obj: dict) -> bool:
@@ -1161,20 +1166,21 @@ def _apply_attribute_form_change(
     do_apply: bool,
 ) -> tuple[bool, str]:
     """
-    Replace an HTML form expression using a schema-edit changeset PUT.
+    Replace an HTML form expression inside a schema-edit changeset.
 
-    Why not alter_form()?
-    ─────────────────────
-    mstrio-py's Attribute.alter_form() uses a PATCH-style endpoint that
-    validates expressions immediately and requires pre-tokenised expressions
-    (tokens or tree). We only have the new formula text; constructing a
-    correct token array client-side is not feasible.
+    1. Open a changeset (schemaEdit=true).
+    2. GET the attribute with showExpressionAs=tokens.
+    3. Replace the form's first expression with the new formula as a single
+       client-level token (see _client_token_expression) and PATCH it.
+    4. GET the attribute again inside the changeset and confirm the form's
+       formula now matches the new one. If it doesn't, try the next token
+       variant; if none match, roll back — never commit an unverified change.
+    5. Commit.
 
-    The schema-changeset PATCH to /model/attributes/{id} (ms-updateAttribute)
-    defers validation to commit time: clearing the tokens/tree keys (not
-    setting them to null — omitting them entirely) signals the I-Server to
-    re-tokenise from text on commit. This is the only reliable way to submit
-    a text-only expression update for attribute schema objects.
+    Earlier versions kept the GET's tokens/tree and changed only ``text``. The
+    GET had no showExpressionAs, so there were no tokens to keep and every
+    PATCH failed with 8004ccde; and had there been tokens, the server would
+    have saved the OLD formula, since ``text`` is read-only.
 
     Stale lock handling
     ───────────────────
@@ -1230,12 +1236,14 @@ def _apply_attribute_form_change(
         #    API under that prefix; fall back to the non-versioned path.
         attr_url = None
         body = None
+        token_params = {"showExpressionAs": "tokens"}
         for path in (
             f"/v2/model/attributes/{attribute_id}",
             f"/model/attributes/{attribute_id}",
         ):
             ga = session._session.get(
-                session.api_url + path, headers=cs_headers, timeout=30,
+                session.api_url + path, headers=cs_headers, params=token_params,
+                timeout=30,
             )
             if ga.ok:
                 attr_url = session.api_url + path
@@ -1249,61 +1257,69 @@ def _apply_attribute_form_change(
                 f"(tried /v2/model/attributes/ and /model/attributes/)"
             )
 
-        # 3. Find the target form and update its first expression text.
-        #    _set_expression_text() updates text but preserves the existing
-        #    tokens/tree (required by the PATCH endpoint); the schemaEdit=true
-        #    changeset commit re-tokenises from the new text.
-        target_form = next(
-            (f for f in (body.get("forms") or [])
-             if (f.get("id") or "").upper() == form_id.upper()),
-            None,
-        )
-        if not target_form:
-            raise RuntimeError(
-                f"form {form_id} not found on attribute {attribute_id}"
+        def form_expressions(attribute_body: dict) -> list:
+            form = next(
+                (f for f in (attribute_body.get("forms") or [])
+                 if (f.get("id") or "").upper() == form_id.upper()),
+                None,
             )
+            if not form:
+                raise RuntimeError(
+                    f"form {form_id} not found on attribute {attribute_id}"
+                )
+            exprs_ = form.get("expressions") or []
+            if not exprs_:
+                raise RuntimeError(f"form {form_id} has no expressions")
+            return exprs_
 
-        exprs = target_form.get("expressions") or []
-        if not exprs:
-            raise RuntimeError(f"form {form_id} has no expressions")
-
+        # 3. Log the current formula and the server's token format.
+        exprs = form_expressions(body)
         old_text = _expression_text(exprs[0])
-
-        # Log the first few raw tokens so we can see the server's token
-        # format if we ever need to build them from scratch.
         old_tokens = (exprs[0].get("expression") or {}).get("tokens") or []
         logger.debug(
-            "attribute={aid} form={fid}: old expression has {n} token(s); "
+            "attribute={aid} form={fid}: old formula {old!r}; {n} token(s), "
             "first 3: {t}",
-            aid=attribute_id, fid=form_id,
-            n=len(old_tokens),
-            t=old_tokens[:3],
+            aid=attribute_id, fid=form_id, old=old_text[:120],
+            n=len(old_tokens), t=old_tokens[:3],
         )
 
-        _set_expression_text(exprs[0], new_expression)
+        # 4. PATCH the new formula as client tokens, then read it back inside
+        #    the changeset. Commit only when the server shows the new formula.
+        wanted = _normalized_formula(new_expression)
+        attempts = []
+        verified = False
+        for variant in _CLIENT_TOKEN_VARIANTS:
+            exprs[0]["expression"] = _client_token_expression(new_expression, variant)
+            pa = session._session.patch(
+                attr_url,
+                headers={**cs_headers, "Content-Type": "application/json"},
+                params=token_params, json=body, timeout=60,
+            )
+            label = f"token {variant or '{value only}'}"
+            if not pa.ok:
+                attempts.append(f"{label}: PATCH HTTP {pa.status_code} {pa.text[:200]}")
+                continue
+            rb = session._session.get(
+                attr_url, headers=cs_headers, params=token_params, timeout=30,
+            )
+            if not rb.ok:
+                attempts.append(f"{label}: read-back HTTP {rb.status_code} {rb.text[:200]}")
+                continue
+            saved = _expression_text(form_expressions(rb.json())[0])
+            if _normalized_formula(saved) == wanted:
+                logger.debug("attribute={aid} form={fid}: accepted with {label}",
+                             aid=attribute_id, fid=form_id, label=label)
+                verified = True
+                break
+            attempts.append(f"{label}: server saved {saved[:200]!r}")
 
-        logger.debug(
-            "changeset PATCH: attribute={aid} form={fid} "
-            "old_text={old!r} new_text={new!r}",
-            aid=attribute_id, fid=form_id,
-            old=old_text[:120], new=new_expression[:120],
-        )
-
-        # 4. PATCH the updated attribute body back (same path that GET succeeded).
-        #    MicroStrategy exposes PATCH /model/attributes/{id} (ms-updateAttribute),
-        #    not PUT.  The schemaEdit=true changeset defers tokenisation to commit
-        #    time, so text-only expressions (no tokens/tree keys) are accepted here.
-        pa = session._session.patch(
-            attr_url,
-            headers={**cs_headers, "Content-Type": "application/json"},
-            json=body, timeout=60,
-        )
-        if not pa.ok:
+        if not verified:
             raise RuntimeError(
-                f"PATCH attribute failed: HTTP {pa.status_code} {pa.text[:200]}"
+                "the server did not take the new formula (changeset rolled back): "
+                + " | ".join(attempts)
             )
 
-        # 5. Commit — the I-Server re-tokenises from text here.
+        # 5. Commit.
         ca = session._session.post(
             session.api_url + f"/model/changesets/{changeset_id}/commit",
             headers=headers, timeout=30,
