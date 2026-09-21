@@ -1336,19 +1336,30 @@ def _apply_attribute_form_change(
         return False, str(exc)
 
     finally:
-        # Roll back the changeset if we never committed (covers every failure
-        # path — exceptions, RuntimeError raises, and any future early returns).
-        if not committed:
-            try:
-                session._session.delete(
-                    session.api_url + f"/model/changesets/{changeset_id}",
-                    headers=headers, timeout=30,
+        # ALWAYS delete the changeset, committed or not. Before commit this is
+        # the rollback; after commit it releases the schema-edit lock, which a
+        # committed changeset keeps holding until it is deleted — mstrio's own
+        # changeset_manager does the same. Skipping it after a commit made every
+        # following row fail with 8004cc41 "Schema editing is in use by another
+        # user" (the other user being this run).
+        try:
+            dr = session._session.delete(
+                session.api_url + f"/model/changesets/{changeset_id}",
+                headers=headers, timeout=30,
+            )
+            logger.debug(
+                "{what} changeset {id}: HTTP {s}",
+                what="Closed" if committed else "Rolled back",
+                id=changeset_id, s=dr.status_code,
+            )
+            if not dr.ok:
+                logger.warning(
+                    "Could not delete changeset {id} (HTTP {s}); the schema-edit lock "
+                    "may stay held until it times out.",
+                    id=changeset_id, s=dr.status_code,
                 )
-                logger.debug(
-                    "Rolled back changeset {id} after failure.", id=changeset_id,
-                )
-            except Exception:
-                pass
+        except Exception as exc:
+            logger.warning("Could not delete changeset {id}: {e}", id=changeset_id, e=exc)
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
