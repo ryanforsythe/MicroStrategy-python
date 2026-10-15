@@ -17,8 +17,9 @@ Subcommands
                recursively expand subgroups and return the effective set
                of users.
 
-  export and members include create_ts, modified_ts and enabled_status
-  (Enabled/Disabled; blank for group members) for every member, fetched
+  export and members include user_login, create_ts, modified_ts and
+  enabled_status (Enabled/Disabled) for every member — user_login and
+  enabled_status are blank for group members.  Metadata is fetched
   once per distinct member in parallel (--concurrency, default 10).
 
 Usage
@@ -82,14 +83,16 @@ _PRIV_CSV_COLS = [
 ]
 _MEMBERS_CSV_COLS = [
     "group_id", "group_name",
-    "member_id", "member_name", "member_type",
+    "member_id", "member_name", "member_type", "user_login",
     "create_ts", "modified_ts", "enabled_status",
 ]
 _RESOLVED_CSV_COLS = [
-    "group_id", "group_name", "user_id", "user_name",
+    "group_id", "group_name", "user_id", "user_name", "user_login",
     "create_ts", "modified_ts", "enabled_status",
 ]
-_MEMBER_META_BLANK = {"create_ts": "", "modified_ts": "", "enabled_status": ""}
+_MEMBER_META_BLANK = {
+    "user_login": "", "create_ts": "", "modified_ts": "", "enabled_status": "",
+}
 
 # ── Privilege helpers ──────────────────────────────────────────────────────────
 
@@ -226,14 +229,16 @@ def _enabled_label(enabled) -> str:
 
 
 def _fetch_member_meta(conn, member_id: str, member_type: str) -> dict:
-    """Fetch created/modified timestamps (and enabled status for users)."""
+    """Fetch created/modified timestamps (and login + enabled status for users)."""
     if member_type == "group":
         obj = UserGroup(conn, id=member_id)
-        enabled = None
+        login, enabled = "", None
     else:
         obj = User(conn, id=member_id)
+        login = getattr(obj, "username", "") or ""
         enabled = getattr(obj, "enabled", None)
     return {
+        "user_login": login,
         "create_ts": _fmt_dt(getattr(obj, "date_created", None)),
         "modified_ts": _fmt_dt(getattr(obj, "date_modified", None)),
         "enabled_status": _enabled_label(enabled),
@@ -585,14 +590,14 @@ def cmd_members(
                 if resolve:
                     for u in members:
                         rows_csv.append([
-                            g.id, g.name, u["id"], u["name"],
+                            g.id, g.name, u["id"], u["name"], u["user_login"],
                             u["create_ts"], u["modified_ts"], u["enabled_status"],
                         ])
                 else:
                     for m in members:
                         rows_csv.append([
                             g.id, g.name, m["id"], m["name"], m["type"],
-                            m["create_ts"], m["modified_ts"], m["enabled_status"],
+                            m["user_login"], m["create_ts"], m["modified_ts"], m["enabled_status"],
                         ])
             else:
                 rows_json.append({
