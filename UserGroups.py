@@ -17,13 +17,18 @@ Subcommands
                recursively expand subgroups and return the effective set
                of users.
 
+  export and members include create_ts, modified_ts and enabled_status
+  (Enabled/Disabled; blank for group members) for every member, fetched
+  once per distinct member in parallel (--concurrency, default 10).
+
 Usage
 ─────
   python UserGroups.py audit      <env>  [--format csv|json] [--output-dir PATH]
   python UserGroups.py export     <env>  [--format csv|json] [--output-dir PATH]
+                                         [--concurrency N]
   python UserGroups.py privileges <env>  [--format csv|json] [--output-dir PATH]
   python UserGroups.py members    <env>  [--format csv|json] [--resolve]
-                                         [--output-dir PATH]
+                                         [--output-dir PATH] [--concurrency N]
 
 Examples
 ────────
@@ -45,11 +50,13 @@ Examples
 
 import argparse
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 
 from loguru import logger
 from mstrio.access_and_security.privilege_mode import PrivilegeMode
-from mstrio.users_and_groups import UserGroup, list_user_groups
+from mstrio.users_and_groups import User, UserGroup, list_user_groups
 
 from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
 from mstrio_core.config import MstrEnvironment
@@ -58,6 +65,7 @@ from mstrio_core.config import MstrEnvironment
 
 ENVS = [e.value for e in MstrEnvironment]
 DEPRECATE_PREFIX = "DEPRECATE-"
+DEFAULT_CONCURRENCY = 10
 
 # ── Column schemas ─────────────────────────────────────────────────────────────
 
@@ -75,8 +83,13 @@ _PRIV_CSV_COLS = [
 _MEMBERS_CSV_COLS = [
     "group_id", "group_name",
     "member_id", "member_name", "member_type",
+    "create_ts", "modified_ts", "enabled_status",
 ]
-_RESOLVED_CSV_COLS = ["group_id", "group_name", "user_id", "user_name"]
+_RESOLVED_CSV_COLS = [
+    "group_id", "group_name", "user_id", "user_name",
+    "create_ts", "modified_ts", "enabled_status",
+]
+_MEMBER_META_BLANK = {"create_ts": "", "modified_ts": "", "enabled_status": ""}
 
 # ── Privilege helpers ──────────────────────────────────────────────────────────
 
@@ -194,6 +207,68 @@ def _resolve_members_recursive(group, conn, visited: set | None = None) -> list[
                 )
 
     return users
+
+
+def _fmt_dt(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def _enabled_label(enabled) -> str:
+    if enabled is True:
+        return "Enabled"
+    if enabled is False:
+        return "Disabled"
+    return ""
+
+
+def _fetch_member_meta(conn, member_id: str, member_type: str) -> dict:
+    """Fetch created/modified timestamps (and enabled status for users)."""
+    if member_type == "group":
+        obj = UserGroup(conn, id=member_id)
+        enabled = None
+    else:
+        obj = User(conn, id=member_id)
+        enabled = getattr(obj, "enabled", None)
+    return {
+        "create_ts": _fmt_dt(getattr(obj, "date_created", None)),
+        "modified_ts": _fmt_dt(getattr(obj, "date_modified", None)),
+        "enabled_status": _enabled_label(enabled),
+    }
+
+
+def _enrich_members(conn, member_lists: list[list[dict]], concurrency: int) -> None:
+    """
+    Add ``create_ts``, ``modified_ts`` and ``enabled_status`` to every member
+    dict in *member_lists* (in place).  Each distinct member is fetched once,
+    in parallel; ``enabled_status`` is blank for group members.
+    """
+    unique: dict = {}
+    for members in member_lists:
+        for m in members:
+            if m.get("id"):
+                unique.setdefault(m["id"], m["type"])
+
+    logger.info("Fetching metadata for {n} distinct member(s) ...", n=len(unique))
+    meta: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        futures = {
+            pool.submit(_fetch_member_meta, conn, mid, mtype): mid
+            for mid, mtype in unique.items()
+        }
+        for fut in as_completed(futures):
+            mid = futures[fut]
+            try:
+                meta[mid] = fut.result()
+            except Exception as exc:
+                logger.warning("Could not fetch member {id}: {exc}", id=mid, exc=exc)
+
+    for members in member_lists:
+        for m in members:
+            m.update(meta.get(m.get("id"), _MEMBER_META_BLANK))
 
 
 def _deduplicate(users: list[dict]) -> list[dict]:
@@ -317,14 +392,16 @@ def cmd_export(
     env: str,
     fmt: str = "json",
     output_dir: Path | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> None:
     """
     Export all groups with their direct members and direct privileges.
 
     Args:
-        env:        Environment to connect to ("dev", "qa", or "prod").
-        fmt:        Output format: "csv" or "json".
-        output_dir: Directory for output files.
+        env:         Environment to connect to ("dev", "qa", or "prod").
+        fmt:         Output format: "csv" or "json".
+        output_dir:  Directory for output files.
+        concurrency: Parallel workers for member metadata fetches.
     """
     config = MstrConfig(environment=MstrEnvironment(env))
     out = output_dir or config.output_dir
@@ -335,11 +412,13 @@ def cmd_export(
         groups = list_user_groups(conn)
         logger.info("Retrieved {n} group(s) from {env}.", n=len(groups), env=env)
 
+        group_members = [(g, _list_direct_members(g)) for g in groups]
+        _enrich_members(conn, [m for _, m in group_members], concurrency)
+
         rows_csv: list = []
         rows_json: list = []
 
-        for g in groups:
-            members = _list_direct_members(g)
+        for g, members in group_members:
             privs = _list_direct_privileges(g)
             desc = getattr(g, "description", "") or ""
 
@@ -349,8 +428,7 @@ def cmd_export(
                     g.name,
                     desc,
                     str(len(members)),
-                    json.dumps([{"id": m["id"], "name": m["name"], "type": m["type"]}
-                                for m in members]),
+                    json.dumps(members),
                     str(len(privs)),
                     json.dumps(privs),
                 ])
@@ -460,16 +538,19 @@ def cmd_members(
     fmt: str = "json",
     resolve: bool = False,
     output_dir: Path | None = None,
+    concurrency: int = DEFAULT_CONCURRENCY,
 ) -> None:
     """
-    List the members of each group.
+    List the members of each group, with each member's created/modified
+    timestamps and (for users) enabled status.
 
     Args:
-        env:        Environment to connect to ("dev", "qa", or "prod").
-        fmt:        Output format: "csv" or "json".
-        resolve:    When True, recursively expand subgroups and return only
-                    the effective set of users (deduplicated).
-        output_dir: Directory for output files.
+        env:         Environment to connect to ("dev", "qa", or "prod").
+        fmt:         Output format: "csv" or "json".
+        resolve:     When True, recursively expand subgroups and return only
+                     the effective set of users (deduplicated).
+        output_dir:  Directory for output files.
+        concurrency: Parallel workers for member metadata fetches.
     """
     config = MstrConfig(environment=MstrEnvironment(env))
     out = output_dir or config.output_dir
@@ -483,9 +564,7 @@ def cmd_members(
         if resolve:
             logger.info("Resolving effective (recursive) user membership ...")
 
-        rows_csv: list = []
-        rows_json: list = []
-
+        group_members: list = []
         for g in groups:
             if resolve:
                 members = _deduplicate(_resolve_members_recursive(g, conn))
@@ -494,15 +573,26 @@ def cmd_members(
                 )
             else:
                 members = _list_direct_members(g)
+            group_members.append((g, members))
 
+        _enrich_members(conn, [m for _, m in group_members], concurrency)
+
+        rows_csv: list = []
+        rows_json: list = []
+
+        for g, members in group_members:
             if fmt == "csv":
                 if resolve:
                     for u in members:
-                        rows_csv.append([g.id, g.name, u["id"], u["name"]])
+                        rows_csv.append([
+                            g.id, g.name, u["id"], u["name"],
+                            u["create_ts"], u["modified_ts"], u["enabled_status"],
+                        ])
                 else:
                     for m in members:
                         rows_csv.append([
                             g.id, g.name, m["id"], m["name"], m["type"],
+                            m["create_ts"], m["modified_ts"], m["enabled_status"],
                         ])
             else:
                 rows_json.append({
@@ -557,6 +647,17 @@ def _add_common_args(sub: argparse.ArgumentParser, default_fmt: str = "json") ->
     )
 
 
+def _add_concurrency_arg(sub: argparse.ArgumentParser) -> None:
+    """Add --concurrency for subcommands that fetch per-member metadata."""
+    sub.add_argument(
+        "--concurrency",
+        type=int,
+        default=DEFAULT_CONCURRENCY,
+        metavar="N",
+        help=f"Parallel workers for member metadata fetches (default: {DEFAULT_CONCURRENCY}).",
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Audit, export, and document MicroStrategy user groups.",
@@ -582,6 +683,7 @@ if __name__ == "__main__":
     )
     p_export.add_argument("env", choices=ENVS, help="Environment to export.")
     _add_common_args(p_export, default_fmt="json")
+    _add_concurrency_arg(p_export)
 
     # ── privileges ────────────────────────────────────────────────────────────
     p_priv = subparsers.add_parser(
@@ -607,6 +709,7 @@ if __name__ == "__main__":
         ),
     )
     _add_common_args(p_members, default_fmt="json")
+    _add_concurrency_arg(p_members)
 
     # ── Dispatch ──────────────────────────────────────────────────────────────
     args = parser.parse_args()
@@ -614,7 +717,12 @@ if __name__ == "__main__":
     if args.subcommand == "audit":
         cmd_audit(env=args.env, fmt=args.fmt, output_dir=args.output_dir)
     elif args.subcommand == "export":
-        cmd_export(env=args.env, fmt=args.fmt, output_dir=args.output_dir)
+        cmd_export(
+            env=args.env,
+            fmt=args.fmt,
+            output_dir=args.output_dir,
+            concurrency=args.concurrency,
+        )
     elif args.subcommand == "privileges":
         cmd_privileges(env=args.env, fmt=args.fmt, output_dir=args.output_dir)
     elif args.subcommand == "members":
@@ -623,4 +731,5 @@ if __name__ == "__main__":
             fmt=args.fmt,
             resolve=args.resolve,
             output_dir=args.output_dir,
+            concurrency=args.concurrency,
         )
