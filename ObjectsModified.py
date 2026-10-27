@@ -85,6 +85,7 @@ Usage
 import argparse
 import json
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -134,6 +135,11 @@ SEARCH_TYPES = sorted(t.value for t in ObjectTypes
                       if t.value is not None and t.value > 0 and t.value != FOLDER_TYPE)
 
 V2_SEARCH_VERSION = '11.4.1200'  # scope / visibility / excludedFolders / includeSubfolders
+
+# begin/endModificationTime format. mstrio documents a literal 'Z'
+# (2021-04-04T06:33:32Z); if a server ignores the filter (every result logged
+# as "outside the window"), try an RFC 822 offset instead: '%Y-%m-%dT%H:%M:%S+0000'.
+MODIFICATION_TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 AREAS = ['Public', 'Schema', 'Profile', 'Other']
 
@@ -189,8 +195,8 @@ def _search_window(start: date, end: date) -> tuple[datetime, datetime]:
 
 
 def _iso_z(dt: datetime) -> str:
-    """Format for begin/end_modification_time: yyyy-MM-ddTHH:mm:ssZ."""
-    return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    """UTC timestamp for begin/end_modification_time (MODIFICATION_TIME_FORMAT)."""
+    return dt.astimezone(timezone.utc).strftime(MODIFICATION_TIME_FORMAT)
 
 
 _TZ_NO_COLON = re.compile(r'([+-]\d{2})(\d{2})$')
@@ -385,6 +391,41 @@ def _run_search(
         offset += PAGE_SIZE
 
 
+class _ThreadConnections:
+    """One logged-in Connection (= one I-Server session) per worker thread.
+
+    Search results live in the session's working set: parallel searches on a
+    shared session evict each other's results, and reading one back fails with
+    ERR004 "Message not found in user history list". Separate sessions also
+    keep `conn.project_id` from being shared across threads.
+    """
+
+    def __init__(self, config: MstrConfig):
+        self._config = config
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._all: list = []
+
+    def get(self):
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = get_mstrio_connection(config=self._config)
+            self._local.conn = conn
+            with self._lock:
+                self._all.append(conn)
+            logger.debug('Opened worker session {n} ({t})',
+                         n=len(self._all), t=threading.current_thread().name)
+        return conn
+
+    def close_all(self) -> None:
+        for conn in self._all:
+            try:
+                conn.close()
+            except Exception as exc:
+                logger.warning('Worker logout failed: {e}', e=exc)
+        self._all.clear()
+
+
 def _search_project(
     conn,
     project,
@@ -395,7 +436,9 @@ def _search_project(
     v2: bool,
 ) -> tuple[list[dict], dict]:
     """Search one project; return (rows, counts)."""
-    counts = {'found': 0, 'folders': 0, 'shortcuts': 0, 'area': 0, 'window': 0, 'kept': 0}
+    counts = {'found': 0, 'folders': 0, 'shortcuts': 0, 'area': 0, 'window': 0,
+              'no_date': 0, 'kept': 0}
+    outside: list[datetime] = []
 
     roots = _resolve_area_roots(conn, project)
     # v1 search has no excludedFolders — areas are then filtered client-side only
@@ -417,7 +460,10 @@ def _search_project(
         modified = _parse_ts(obj.get('date_modified'))
         if modified is not None and not (begin_utc <= modified < end_utc):
             counts['window'] += 1
+            outside.append(modified)
             continue
+        if modified is None:
+            counts['no_date'] += 1
 
         ancestors = obj.get('ancestors')
         if ancestors is None:
@@ -450,6 +496,18 @@ def _search_project(
         })
 
     counts['kept'] = len(rows)
+    if outside:
+        # The server should only return objects inside the window; if it doesn't,
+        # it most likely ignored begin/endModificationTime.
+        logger.warning(
+            '[{p}] server returned {n} object(s) outside the window, modified '
+            '{lo} → {hi} (UTC); the server-side date filter was likely not applied',
+            p=project.name, n=len(outside),
+            lo=_fmt(min(outside), local=False), hi=_fmt(max(outside), local=False),
+        )
+    if counts['no_date']:
+        logger.warning('[{p}] {n} object(s) had no parseable date_modified — kept',
+                       p=project.name, n=counts['no_date'])
     return rows, counts
 
 
@@ -504,12 +562,14 @@ def main(
 
     all_rows: list[dict] = []
     failed = 0
+    workers = _ThreadConnections(config)
+
+    def _task(project):
+        return _search_project(workers.get(), project, begin_utc, end_utc,
+                               areas, exclude_library_shortcuts, v2)
+
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = {
-            pool.submit(_search_project, conn, p, begin_utc, end_utc,
-                        areas, exclude_library_shortcuts, v2): p
-            for p in projects
-        }
+        futures = {pool.submit(_task, p): p for p in projects}
         for fut in as_completed(futures):
             proj = futures[fut]
             try:
@@ -526,6 +586,12 @@ def main(
                 s=c['shortcuts'], a=c['area'], w=c['window'],
             )
             all_rows.extend(rows)
+
+    workers.close_all()
+    try:
+        conn.close()
+    except Exception as exc:
+        logger.warning('Logout failed: {e}', e=exc)
 
     all_rows.sort(key=lambda r: (r['project_name'], r['date_modified_utc'], r['object_name']))
 
