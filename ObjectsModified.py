@@ -94,16 +94,16 @@ from typing import Optional
 from loguru import logger
 # mstrio.api wrappers take project_id per call — the OO classes (Folder, Entity)
 # read conn.project_id, which isn't safe with projects searched in parallel.
-from mstrio.api import folders as folders_api, objects as objects_api
+from mstrio.api import browsing as browsing_api, folders as folders_api, objects as objects_api
 from mstrio.object_management.search_operations import (
     SearchDomain,
     SearchScope,
-    get_search_results,
     start_full_search,
 )
 from mstrio.object_management.predefined_folders import PredefinedFolders
 from mstrio.server import Environment
 from mstrio.types import ObjectSubTypes, ObjectTypes
+from mstrio.utils.helper import camel_to_snake
 from mstrio.utils.version_helper import meets_minimal_version
 
 from mstrio_core import (
@@ -123,6 +123,7 @@ from mstrio_core.config import MstrEnvironment
 OUTPUT_FILENAME = 'objects_modified_{env}_{start}_{end}_{ts}.{ext}'
 DEFAULT_CONCURRENCY = 5
 PAGE_SIZE = 1000
+TOTAL_COUNT_HEADER = 'x-mstr-total-count'
 
 FOLDER_TYPE = ObjectTypes.FOLDER.value                         # 8
 LIBRARY_SHORTCUT_SUBTYPE = ObjectSubTypes.LIBRARY_SHORTCUT.value  # 4609
@@ -136,9 +137,10 @@ SEARCH_TYPES = sorted(t.value for t in ObjectTypes
 
 V2_SEARCH_VERSION = '11.4.1200'  # scope / visibility / excludedFolders / includeSubfolders
 
-# begin/endModificationTime format. mstrio documents a literal 'Z'
-# (2021-04-04T06:33:32Z); if a server ignores the filter (every result logged
-# as "outside the window"), try an RFC 822 offset instead: '%Y-%m-%dT%H:%M:%S+0000'.
+# begin/endModificationTime format (mstrio documents a literal 'Z'). The v1
+# search (I-Server < 11.4.1200) ignores the filter in every format — tested on
+# 11.3.1160 with '...ssZ', '...ss+0000' and '...ss.000Z': all returned the full
+# project — so dates are always re-checked client-side.
 MODIFICATION_TIME_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 AREAS = ['Public', 'Schema', 'Profile', 'Other']
@@ -352,6 +354,7 @@ def _run_search(
     end_utc: datetime,
     exclude: list[str],
     v2: bool,
+    stats: dict,
 ):
     """Start one project-wide metadata search and yield its result dicts page
     by page."""
@@ -372,23 +375,47 @@ def _run_search(
         **v2_args,
     )
     search_id = search['id']
-    logger.debug('[{p}] search {sid} started (excluded={x})',
-                 p=project.name, sid=search_id, x=exclude)
+    logger.debug('[{p}] search {sid} started (excluded={x}, totalItems={t})',
+                 p=project.name, sid=search_id, x=exclude, t=search.get('totalItems'))
 
+    # Page by the server's reported total, not by page size: a short page does
+    # NOT mean the end (results the login can't see are dropped from a page,
+    # so a full 1000-row page can arrive as 998).
+    total: Optional[int] = None
     offset = 0
+    fetched = 0
+    seen: set = set()
     while True:
-        page = get_search_results(
-            conn,
-            search_id=search_id,
-            project=project.id,
-            limit=PAGE_SIZE,
-            offset=offset,
-            to_dictionary=True,
-        ) or []
-        yield from page
-        if len(page) < PAGE_SIZE:
-            return
+        r = browsing_api.get_search_results(
+            conn, search_id=search_id, project_id=project.id,
+            offset=offset, limit=PAGE_SIZE,
+        )
+        if total is None:
+            hdr = r.headers.get(TOTAL_COUNT_HEADER)
+            total = int(hdr) if hdr and hdr.isdigit() else None
+            stats['server_total'] = total
+            logger.debug('[{p}] search {sid}: server total {t}',
+                         p=project.name, sid=search_id, t=total)
+        page = camel_to_snake(r.json() or [])
+        if isinstance(page, dict):  # some servers wrap the list
+            page = page.get('result') or []
+        if not page:
+            break
+        new = [o for o in page if o.get('id') not in seen]
+        if not new:  # server ignored offset and repeated a page
+            logger.warning('[{p}] search {sid}: offset {o} returned only repeats — stopping',
+                           p=project.name, sid=search_id, o=offset)
+            break
+        seen.update(o.get('id') for o in new)
+        fetched += len(new)
+        yield from new
         offset += PAGE_SIZE
+        if total is not None and offset >= total:
+            break
+
+    if total is not None and fetched < total:
+        logger.debug('[{p}] {f} of {t} results readable (rest not visible to login)',
+                     p=project.name, f=fetched, t=total)
 
 
 class _ThreadConnections:
@@ -436,8 +463,8 @@ def _search_project(
     v2: bool,
 ) -> tuple[list[dict], dict]:
     """Search one project; return (rows, counts)."""
-    counts = {'found': 0, 'folders': 0, 'shortcuts': 0, 'area': 0, 'window': 0,
-              'no_date': 0, 'kept': 0}
+    counts = {'server_total': None, 'found': 0, 'folders': 0, 'shortcuts': 0,
+              'area': 0, 'window': 0, 'no_date': 0, 'kept': 0}
     outside: list[datetime] = []
 
     roots = _resolve_area_roots(conn, project)
@@ -446,7 +473,7 @@ def _search_project(
     logger.debug('[{p}] excluded folders: {x}', p=project.name, x=exclude)
 
     rows: list[dict] = []
-    for obj in _run_search(conn, project, begin_utc, end_utc, exclude, v2):
+    for obj in _run_search(conn, project, begin_utc, end_utc, exclude, v2, counts):
         counts['found'] += 1
         type_id = _int(obj.get('type'))
         subtype_id = _int(obj.get('subtype'))
@@ -497,11 +524,11 @@ def _search_project(
 
     counts['kept'] = len(rows)
     if outside:
-        # The server should only return objects inside the window; if it doesn't,
-        # it most likely ignored begin/endModificationTime.
-        logger.warning(
+        # v2 should only return objects inside the window, so this means its date
+        # filter wasn't applied. v1 always ignores it (logged once in main).
+        (logger.warning if v2 else logger.debug)(
             '[{p}] server returned {n} object(s) outside the window, modified '
-            '{lo} → {hi} (UTC); the server-side date filter was likely not applied',
+            '{lo} → {hi} (UTC); the server-side date filter was not applied',
             p=project.name, n=len(outside),
             lo=_fmt(min(outside), local=False), hi=_fmt(max(outside), local=False),
         )
@@ -548,9 +575,11 @@ def main(
                 s='v2' if v2 else 'v1')
     if not v2:
         logger.warning(
-            'I-Server {v} predates {req}: the v1 search has no scope or visibility '
-            'filter, so system-managed objects are NOT excluded and hidden objects '
-            'come back unfiltered; area narrowing runs client-side only',
+            'I-Server {v} predates {req}: the v1 search ignores the modification-date '
+            'filter, so every project is listed in full and dates are filtered '
+            'client-side (slower on large projects); it also has no scope or '
+            'visibility filter, so system-managed objects are NOT excluded and hidden '
+            'objects come back unfiltered; area narrowing runs client-side only',
             v=conn.iserver_version, req=V2_SEARCH_VERSION,
         )
 
@@ -580,9 +609,10 @@ def main(
                              name=proj.name, id=proj.id, e=exc)
                 continue
             logger.info(
-                '[{name}] {kept} kept of {found} found '
+                '[{name}] {kept} kept of {found} read (server total {t}) '
                 '(folders {f}, library shortcuts {s}, other areas {a}, outside window {w})',
-                name=proj.name, kept=c['kept'], found=c['found'], f=c['folders'],
+                name=proj.name, kept=c['kept'], found=c['found'], t=c['server_total'],
+                f=c['folders'],
                 s=c['shortcuts'], a=c['area'], w=c['window'],
             )
             all_rows.extend(rows)
