@@ -1,0 +1,77 @@
+# ── SystemManager_ClearCache configuration ───────────────────────────────────
+#
+# Used by SystemManager_ClearCache.py to run the MarketIntelligence_ClearCache
+# workflow against any project / database. Copy this file once per workflow
+# (e.g. crop_canada.yaml, crop_eu.yaml) and supply via --config.
+#
+# All SQL executes through pre-created Freeform SQL reports in the project so
+# the database connection is managed by MicroStrategy's datasource — no
+# database driver / credentials are needed in Python. Same template, any DB.
+#
+# Credentials for the MicroStrategy connection itself come from environment
+# variables (.env), not this file. See README / mstrio_core.
+
+# Active MicroStrategy environment — selects MSTR_{ENV}_* env vars.
+# One of: dev, qa, prod
+env: dev
+
+# Project that owns the FFSQL reports and the cache to invalidate.
+# Provide name OR id (id wins if both are set).
+project:
+  name: "Crop Canada"
+  # id: "C0F1A8B5447DF22F1B1234567890ABCD"
+
+# ── Freeform SQL reports ─────────────────────────────────────────────────────
+# Pre-create one report per SQL statement in the project, pointing at the
+# correct database datasource. Paste each report's GUID here.
+#
+# Required SQL per report:
+#
+# check_refresh:
+#   SELECT TOP 1 case when MIDWHLoadHistoryId is not null then 1 else 0 end AS Result
+#   FROM   [BPIPlus].[MicroStrategy].[MIDWHLoadHistory]
+#   WHERE  DropMSCacheDataTime is null
+#   GROUP  BY [MIDWHLoadHistoryId], DropMSCacheDataTime
+#   ORDER  BY [MIDWHLoadHistoryId] DESC;
+#
+# retrieve_ids:
+#   SELECT substring(
+#            (SELECT ',' + convert(varchar(10), MIDWHLoadHistoryId) AS 'data()'
+#             FROM   BPIPlus.MicroStrategy.MIDWHLoadHistory
+#             WHERE  DropMSCacheDataTime IS NULL
+#             FOR XML PATH('')) ,2 ,9999) AS MILoadIDs;
+#
+# indicate_cache_drop  (one VALUE prompt — title or key matches
+#                       indicate_cache_drop_prompt_key below):
+#   EXEC BPIPlus.MicroStrategy.IndicateCacheDropHappened ?[MIDWHLoadHistoryIds];
+#   SELECT 1 AS Status;     -- result set is required by Freeform SQL
+
+freeform_sql_reports:
+  check_refresh:        "REPLACE_WITH_REPORT_GUID"
+  retrieve_ids:         "REPLACE_WITH_REPORT_GUID"
+  indicate_cache_drop:  "REPLACE_WITH_REPORT_GUID"
+  # Prompt key/title on the indicate_cache_drop report. Default is
+  # "MIDWHLoadHistoryIds" — change if your prompt is named differently.
+  indicate_cache_drop_prompt_key: "MIDWHLoadHistoryIds"
+
+# ── I-Server events to trigger ───────────────────────────────────────────────
+
+events:
+  refresh_cubes: "Refresh-Crop-Canada-Cubes Trigger"
+  notify:        "NotifyClearCache"
+
+# ── Failure notification (optional) ──────────────────────────────────────────
+# If on_failure_email + smtp_server are set, the script attempts to send a
+# high-importance email on any of the SQL / cache / event-trigger failures.
+# Outbound SMTP is sometimes blocked in the MCE Python runtime — the script
+# logs the send error and exits non-zero so the calling MCE Workflow can
+# escalate via its own notification channel.
+
+notification:
+  on_failure_email: "AltusAdministrators@email.com"
+  smtp_server:      "smtp.servername.int"
+  smtp_port:        25
+  from_address:     "noreply@example.com"
+  use_tls:          false
+  # smtp_username:   "..."
+  # smtp_password:   "..."

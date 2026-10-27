@@ -28,8 +28,13 @@ Confirmed design decisions
     (BFF662B4C6451F461A754CAEC51B1036), keeping each sub's original recipients.
 
 Steps (run individually via --steps or 'all')
-  update-devices  create-devices  update-addresses
+  validate        update-devices  create-devices  update-addresses
   clean-addresses clean-devices   admin-subs       json-map
+
+The admin-subs step sources Administrator subscription definitions + prompt
+answers from the COMPREHENSIVE JSON produced by:
+    python SubscriptionsExport.py <source-env> --format json
+Pass that file with --subscriptions-json; if omitted, admin-subs prompts for it.
 
 Usage
 ─────
@@ -39,8 +44,9 @@ Usage
   # Execute only the device updates + new devices
   python SubscriptionFileMigration.py dev --steps update-devices,create-devices --apply
 
-  # Full apply, with source env for faithful Administrator-sub recreation
-  python SubscriptionFileMigration.py prod --steps all --source-env dev --apply
+  # Recreate Administrator subs from the JSON export (replays prompt answers)
+  python SubscriptionFileMigration.py prod --steps admin-subs \\
+         --subscriptions-json c:/tmp/subscriptions_export_dev_20260616.json --apply
 """
 
 import argparse
@@ -64,8 +70,15 @@ from mstrio.distribution_services import (
 )
 from mstrio.distribution_services.device import Device, list_devices
 from mstrio.distribution_services.device.device_properties import FileDeviceProperties
+from mstrio.distribution_services.subscription.content import Content
+from mstrio.distribution_services.subscription.delivery import Delivery
 from mstrio.server import Environment
 from mstrio.users_and_groups import User, list_users
+
+try:
+    from mstrio.modeling.prompt import Prompt
+except ImportError:
+    Prompt = None
 
 from mstrio_core import MstrConfig, get_mstrio_connection
 from mstrio_core.config import MstrEnvironment
@@ -606,25 +619,30 @@ def _content_filename(delivery, kind_attr):
     return getattr(sub, 'filename', None) if sub else None
 
 
-def step_admin_subs(conn, src_conn, data, apply: bool) -> list[dict]:
-    """Validate which Administrator subscriptions from the workbook are missing
-    on the target, and (with a source connection) recreate them under
-    subscription_admin keeping the original recipients."""
-    # Distinct Administrator subscriptions from the workbook
-    admin_subs: dict[str, dict] = {}
-    for r in data[SHEET_SUBS]:
-        if (r.get('owner_name', '') or '').strip().lower() != 'administrator':
-            continue
-        sid = r.get('subscription_id', '').strip()
-        if sid and sid not in admin_subs:
-            admin_subs[sid] = {
-                'subscription_id': sid,
-                'subscription_name': r.get('subscription_name', '').strip(),
-                'project_id': r.get('project_id', '').strip(),
-                'project_name': r.get('project_name', '').strip(),
-                'delivery_mode': (r.get('delivery_mode', '') or '').strip().upper(),
-            }
-    logger.info('{n} distinct Administrator subscription(s) in workbook', n=len(admin_subs))
+def _load_subscriptions_json(path: Path) -> list[dict]:
+    """Load the comprehensive JSON export produced by SubscriptionsExport.py
+    (--format json). Accepts a list of subscription objects, or a single one."""
+    raw = json.loads(Path(path).read_text(encoding='utf-8'))
+    if isinstance(raw, dict):
+        raw = [raw]
+    return raw
+
+
+def step_admin_subs(conn, subs_json_path: Path, apply: bool) -> list[dict]:
+    """Validate which Administrator subscriptions from the comprehensive JSON
+    export are missing on the target, and recreate the missing ones under
+    subscription_admin — keeping the original recipients and replaying captured
+    prompt answers.
+
+    Source of truth = the JSON file from `SubscriptionsExport.py <env> --format json`
+    (full definition + prompts[].key/.answers)."""
+    all_subs = _load_subscriptions_json(subs_json_path)
+    admin_subs = [
+        s for s in all_subs
+        if ((s.get('owner') or {}).get('name') or '').strip().lower() == 'administrator'
+    ]
+    logger.info('{a} Administrator subscription(s) of {t} in JSON',
+                a=len(admin_subs), t=len(all_subs))
 
     # Target existing subscription names per project
     target_names: dict[str, set] = {}
@@ -637,11 +655,21 @@ def step_admin_subs(conn, src_conn, data, apply: bool) -> list[dict]:
             target_names[proj.id] = set()
 
     results = []
-    for sid, info in admin_subs.items():
-        pid, name, mode = info['project_id'], info['subscription_name'], info['delivery_mode']
-        exists = name.lower() in target_names.get(pid, set())
+    for sub in admin_subs:
+        pid  = sub.get('project_id') or sub.get('projectId') or ''
+        name = sub.get('name', '')
+        mode = ((sub.get('delivery') or {}).get('mode') or '').strip().upper()
+        prompts = sub.get('prompts') or []
+        info = {
+            'subscription_id': sub.get('id', ''),
+            'subscription_name': name,
+            'project_id': pid,
+            'project_name': sub.get('project_name', ''),
+            'delivery_mode': mode,
+            'prompted': bool(prompts),
+        }
 
-        if exists:
+        if name.strip().lower() in target_names.get(pid, set()):
             results.append({**info, 'status': 'present', 'details': 'already on target'})
             continue
 
@@ -650,38 +678,49 @@ def step_admin_subs(conn, src_conn, data, apply: bool) -> list[dict]:
                             'details': f'delivery mode {mode} not auto-recreated'})
             continue
 
-        if not apply or src_conn is None:
-            detail = ('would create under subscription_admin'
-                      if src_conn is not None
-                      else 'MISSING — supply --source-env to recreate (needs source definition)')
-            results.append({**info, 'status': 'dry-run' if src_conn is not None else 'missing',
-                            'details': detail})
+        if not apply:
+            extra = ' + replay prompt answers' if prompts else ''
+            results.append({**info, 'status': 'dry-run',
+                            'details': f'would create under subscription_admin{extra}'})
             continue
 
-        # Apply: read source definition and recreate
+        # Apply: recreate from the JSON definition
         try:
-            src = Subscription(src_conn, id=sid, project_id=pid)
-            recipients = [{'id': rec['id']} for rec in (src.recipients or []) if rec.get('id')]
-            schedules  = [s.id for s in (src.schedules or [])]
-            new_id = _recreate_subscription(conn, src, info, recipients, schedules)
-            results.append({**info, 'status': 'created',
-                            'details': f'new subscription id {new_id}'})
+            contents   = [Content.from_dict(c, conn) for c in (sub.get('contents') or [])]
+            delivery   = Delivery.from_dict(sub.get('delivery') or {}, conn)
+            recipients = [{'id': r['id']} for r in (sub.get('recipients') or []) if r.get('id')]
+            schedules  = [s['id'] for s in (sub.get('schedules') or []) if s.get('id')]
+
+            created = _recreate_subscription(
+                conn, delivery, contents, info, recipients, schedules)
+            detail, status = f'new id {created.id}', 'created'
+
+            if prompts:
+                try:
+                    note = _apply_prompt_answers(conn, created, prompts)
+                    detail += f'; {note}'
+                    status = 'created+answered'
+                except Exception as pe:
+                    detail += f'; PROMPT ANSWER FAILED: {pe}'
+                    status = 'created-prompt-error'
+
+            results.append({**info, 'status': status, 'details': detail})
         except Exception as exc:
             results.append({**info, 'status': 'error', 'details': str(exc)})
 
     return results
 
 
-def _recreate_subscription(conn, src, info, recipients, schedules) -> str:
-    """Recreate one subscription on the target under subscription_admin."""
+def _recreate_subscription(conn, delivery, contents, info, recipients, schedules):
+    """Recreate one subscription on the target under subscription_admin.
+    Returns the created Subscription object."""
     mode = info['delivery_mode']
     pid  = info['project_id']
     name = info['subscription_name']
-    delivery = src.delivery
     common = dict(
         connection=conn, name=name, project_id=pid,
         owner_id=SUBSCRIPTION_ADMIN_ID, schedules=schedules,
-        contents=src.contents, recipients=recipients,
+        contents=contents, recipients=recipients,
     )
 
     if mode == 'EMAIL':
@@ -709,7 +748,33 @@ def _recreate_subscription(conn, src, info, recipients, schedules) -> str:
     else:
         raise ValueError(f'unsupported delivery mode {mode}')
 
-    return created.id
+    return created
+
+
+def _apply_prompt_answers(conn, created, prompts: list[dict]) -> str:
+    """Replay captured prompt answers onto a freshly created subscription using
+    the prompts[] block from the comprehensive JSON (each has key/type/answers).
+    Prompts with no saved answer fall back to use_default."""
+    if Prompt is None:
+        raise RuntimeError('mstrio.modeling.prompt.Prompt unavailable — cannot replay answers')
+
+    answers, answered = [], 0
+    for p in prompts:
+        ans = p.get('answers')
+        has_answer = bool(ans) and not (isinstance(ans, (list, dict)) and len(ans) == 0)
+        answers.append(Prompt(
+            connection=conn,
+            id=p.get('id'),
+            key=p.get('key'),
+            type=p.get('type'),
+            answers=(ans if has_answer else None),
+            use_default=not has_answer,
+        ))
+        if has_answer:
+            answered += 1
+
+    created.answer_prompts(answers, force=True)
+    return f'{answered}/{len(answers)} prompt(s) answered (rest use_default)'
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -807,7 +872,7 @@ def _write_report(results: dict[str, list[dict]], out_dir: Path, env: str,
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
-def main(env, steps, apply, workbook, source_env, output_dir, concurrency) -> int:
+def main(env, steps, apply, workbook, subscriptions_json, output_dir, concurrency) -> int:
     config  = MstrConfig(environment=MstrEnvironment(env))
     out_dir = output_dir or config.output_dir
 
@@ -818,16 +883,24 @@ def main(env, steps, apply, workbook, source_env, output_dir, concurrency) -> in
     logger.info('Loading workbook {p}', p=wb_path)
     data = _load_workbook(wb_path)
 
+    # ── Resolve the JSON subscriptions input file (admin-subs source) ─────────
+    subs_json_path: Optional[Path] = None
+    if STEP_ADMIN_SUBS in steps:
+        raw = subscriptions_json
+        if not raw:
+            raw = input(
+                'Path to the JSON subscriptions export '
+                '(from SubscriptionsExport.py <env> --format json): '
+            ).strip().strip('"')
+        subs_json_path = Path(raw)
+        if not subs_json_path.exists():
+            logger.error('Subscriptions JSON not found: {p}', p=subs_json_path)
+            return 1
+        logger.info('Admin-subs source: {p}', p=subs_json_path)
+
     # ── CONNECTION (target) ───────────────────────────────────────────────────
     conn = get_mstrio_connection(config=config)
     # Workstation alternative:  conn = get_connection(workstationData)
-
-    # ── CONNECTION (source, for admin-subs recreation) ────────────────────────
-    src_conn = None
-    if source_env:
-        src_config = MstrConfig(environment=MstrEnvironment(source_env))
-        src_conn = get_mstrio_connection(config=src_config)
-        logger.info('Source connection established ({e})', e=source_env)
 
     # Single device snapshot reused across steps
     snap_by_id, snap_by_name = _device_snapshot(conn)
@@ -864,7 +937,7 @@ def main(env, steps, apply, workbook, source_env, output_dir, concurrency) -> in
 
     if STEP_ADMIN_SUBS in steps:
         logger.info('=== {s} ===', s=STEP_ADMIN_SUBS)
-        results[STEP_ADMIN_SUBS] = step_admin_subs(conn, src_conn, data, apply)
+        results[STEP_ADMIN_SUBS] = step_admin_subs(conn, subs_json_path, apply)
 
     if STEP_JSON_MAP in steps:
         logger.info('=== {s} ===', s=STEP_JSON_MAP)
@@ -897,9 +970,11 @@ if __name__ == '__main__':
                         help='Execute changes (default: dry run).')
     parser.add_argument('--workbook', default=DEFAULT_WORKBOOK, metavar='XLSX',
                         help=f'Mapping workbook (default: {DEFAULT_WORKBOOK}).')
-    parser.add_argument('--source-env', default=None, choices=[e.value for e in MstrEnvironment],
-                        help='Source environment to read Administrator sub definitions from '
-                             '(required to recreate them under subscription_admin).')
+    parser.add_argument('--subscriptions-json', default=None, metavar='JSON',
+                        help='Comprehensive JSON subscriptions export '
+                             '(SubscriptionsExport.py <env> --format json) — source of '
+                             'Administrator sub definitions + prompt answers for admin-subs. '
+                             'If omitted when admin-subs runs, you will be prompted for the path.')
     parser.add_argument('--output-dir', type=Path, default=None, metavar='DIR',
                         help='Output directory for report + JSON (default: MSTR_OUTPUT_DIR).')
     parser.add_argument('--concurrency', type=int, default=DEFAULT_CONCURRENCY, metavar='N',
@@ -919,6 +994,6 @@ if __name__ == '__main__':
 
     raise SystemExit(main(
         env=args.env, steps=steps, apply=args.apply, workbook=args.workbook,
-        source_env=args.source_env, output_dir=args.output_dir,
+        subscriptions_json=args.subscriptions_json, output_dir=args.output_dir,
         concurrency=args.concurrency,
     ))

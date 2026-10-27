@@ -11,11 +11,61 @@ Runtime variables are modeled on the mstrio-py `psycopg2_all_actions_template.py
 convention: `$`-prefixed placeholders that Workstation substitutes at run time
 (text -> quoted string). Define these in the script's variable panel:
 
-    $project        text    Project GUID          e.g. 3614601D9F9144D384FD3ABBFE2AC0F2
+    $project_id        text    Project GUID          e.g. 3614601D9F9144D384FD3ABBFE2AC0F2
     $dashboard_id   text    Dashboard GUID        e.g. 92D04B0F1140547CC9F5D9B64868B052
     $chapter        text    Chapter key           default K36
     $visualization  text    Visualization key     default K52
     $datamart_id    text    Datamart/Report GUID  e.g. 35FF9EB541DDF18C483275AAF3C87E8A
+    $workflow_config_json text JSON specifying the workflow configuration.
+    $workflow_only  text    Specify to run only the workflow items default False
+    $config_name    text    Identifies THIS configuration in logs, e.g. 'CropCanada_CacheDrop'
+    $log_level      text    DEBUG | INFO | WARNING | ERROR (default INFO)
+
+--------------------------------------------------------------------------------
+Logging (MCE Planned Tasks)
+--------------------------------------------------------------------------------
+Each Planned Task carries its own variable set, so $config_name is what makes
+logging per-configuration. Every line is tagged:
+
+    2026-07-20 14:03:11 | INFO    | CropCanada_CacheDrop | 20260720T140311Z-a1b2c3 | ...
+                                    ^ $config_name         ^ RUN_ID (unique per run)
+
+Two sinks:
+  * stdout          — captured in the Planned Task run history.
+  * rotating file   — LOG_DIR/<config_name>.log (5 MB x 5 backups). Durable
+                      history across runs, and the only place DEBUG lines land
+                      if the task history truncates. Best-effort: if LOG_DIR is
+                      not writable the run continues on stdout alone.
+
+Plus a machine-readable report per run: LOG_DIR/<config_name>_<RUN_ID>.json,
+containing the step-by-step outcome, timings, and any error. On failure the
+report still lists the steps that DID complete, which is what you need to know
+before re-running (e.g. caches already invalidated, events already fired).
+
+LOG_DIR defaults to /opt/mstr/ContainerState/Logs/ProjectTriggerWorkflow and can
+be overridden with the PTW_LOG_DIR environment variable. Set $log_level to DEBUG
+to add datamart poll ticks and the full result payload.
+
+The script exits non-zero on failure so the Planned Task is marked failed rather
+than silently completed.
+
+--------------------------------------------------------------------------------
+Connection retry
+--------------------------------------------------------------------------------
+Unlike an interactive Workstation run (which borrows an already-open, already
+-warm session), a Planned Task has no live session to reuse — it independently
+authenticates via the injected `connectionData` object on every run. If the MCE
+environment was idle/suspended and this trigger is what wakes it, the Library
+service's internal DNS registration can lag behind the rest of the environment
+coming up, so the very first connection attempt can fail with
+`requests.exceptions.ConnectionError` (DNS "Name or service not known") before
+the environment finishes waking.
+
+`connect_with_retry()` retries ONLY that class of failure (ConnectionError /
+Timeout), up to CONNECT_MAX_ATTEMPTS times with CONNECT_RETRY_DELAY_SECONDS
+between attempts, then raises the last error. It does not mask a genuinely
+wrong or permanently stale connectionData host — it only rides through a
+transient startup window.
 
 Overall flow:
     1. Create a Dashboard instance and read the target visualization's grid.
@@ -58,9 +108,11 @@ Process types (all mstrio-py driven):
 
   ContentCacheDelete
       module : mstrio.project_objects.content_cache.ContentCache
-               .delete_all_caches(conn, project_id=PROJECTID, status=STATUS, force=True)
+               .list_caches(conn, project_id=PROJECTID, status=STATUS,
+               to_dictionary=True) to gather cache ids, then
+               .delete_caches(conn, cache_ids=[...], force=True)
       projectID   (required)  project GUID whose caches to delete
-      status      (optional)  cache status filter (default: all)
+      status      (optional)  cache status filter for list_caches (default 'ready')
       waitSeconds (optional)  seconds to pause AFTER deleting (default 0)
 
 Example WORKFLOW_CONFIG_JSON:
@@ -72,19 +124,47 @@ Example WORKFLOW_CONFIG_JSON:
 """
 
 import json
+import logging
+import logging.handlers
+import os
+import re
+import sys
 import time
+import uuid
+from datetime import datetime, timezone
+
+import requests
 
 from mstrio.connection import get_connection
 from mstrio.distribution_services.event import Event
 from mstrio.project_objects.content_cache import ContentCache
 
 # --- Substituted by Workstation (text -> 'quoted') --------------------------
-PROJECT_ID        = $project
-DASHBOARD_ID      = $dashboard_id
-CHAPTER_KEY       = $chapter
+PROJECT_ID = $project_id
+DASHBOARD_ID = $dashboard_id
+CHAPTER_KEY = $chapter
 VISUALIZATION_KEY = $visualization
-DATAMART_ID       = $datamart_id
+DATAMART_ID = $datamart_id
+CONFIG_NAME = $config_name
+LOG_LEVEL = $log_level
 # ----------------------------------------------------------------------------
+
+# Where per-configuration log files are written. Override with the PTW_LOG_DIR
+# env var. /opt/mstr/ContainerState is the MCE container path that survives
+# restarts (same volume used for file subscriptions) — verify it is writable in
+# your environment. File logging is best-effort: if this path is unavailable the
+# run continues with stdout logging only.
+LOG_DIR = os.environ.get(
+    'PTW_LOG_DIR', '/opt/mstr/ContainerState/Logs/ProjectTriggerWorkflow'
+)
+LOG_MAX_BYTES = 5_000_000
+LOG_BACKUP_COUNT = 5
+
+# Correlates every line of one execution, and names that run's JSON report.
+RUN_ID = (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+          + '-' + uuid.uuid4().hex[:6])
+
+log = logging.getLogger('ProjectTriggerWorkflow')
 
 # The attribute name on the visualization that carries the Load History IDs.
 # Do NOT change this unless the dashboard's attribute display name changes.
@@ -96,21 +176,84 @@ RUNNING_STATUSES     = {5}
 POLL_INTERVAL_SECONDS = 3
 POLL_TIMEOUT_SECONDS  = 300
 
+# Connection retry — rides through the wake-from-idle DNS-propagation window
+# described above. 6 attempts * 20s = up to ~2 minutes of tolerance before
+# the initial connection attempt gives up and the run fails for real.
+CONNECT_MAX_ATTEMPTS       = 6
+CONNECT_RETRY_DELAY_SECONDS = 20
+
 # Standalone toggle — set True to run ONLY the configured workflow steps and
 # skip the dashboard/datamart entirely (useful for testing Event/Cache actions
 # in isolation). When False, the normal dashboard -> workflow -> datamart flow
 # runs and the workflow is gated on the visualization returning rows.
-WORKFLOW_ONLY = False
+#WORKFLOW_ONLY = False
+WORKFLOW_ONLY = $workflow_only
 
 # Configurable workflow steps — edit this JSON array. See the module docstring
 # for the schema. Runs only when the dashboard visualization returns rows.
-WORKFLOW_CONFIG_JSON = '''
-[
-  {"type": "EventTrigger",           "eventID": "REPLACE_WITH_EVENT_GUID",   "waitSeconds": 0},
-  {"type": "ContentCacheInvalidate", "projectID": "REPLACE_WITH_PROJECT_GUID", "status": "ready", "waitSeconds": 50},
-  {"type": "ContentCacheDelete",     "projectID": "REPLACE_WITH_PROJECT_GUID", "status": "ready", "waitSeconds": 0}
-]
-'''
+
+
+WORKFLOW_CONFIG_JSON = $workflow_config_json
+
+
+# ---------------------------------------------------------------------------
+# Logging — per configuration, dual sink (stdout + rotating file)
+# ---------------------------------------------------------------------------
+def _safe_name(value):
+    """Reduce a config name to something safe for a filename."""
+    return re.sub(r'[^A-Za-z0-9._-]+', '_', str(value or 'unnamed')).strip('_')
+
+
+def setup_logging():
+    """Configure the module logger. Stdout is captured by the Planned Task run
+    history; the file sink gives durable, per-configuration history.
+
+    Uses the stdlib `logging` module rather than loguru: loguru is not
+    guaranteed to be installed in the MCE Python runtime, and a missing import
+    would fail the task before anything useful is logged.
+    """
+    log.setLevel(getattr(logging, str(LOG_LEVEL).upper(), logging.INFO))
+    log.handlers.clear()   # re-runs in a warm interpreter must not double-log
+    log.propagate = False
+
+    fmt = logging.Formatter(
+        fmt=f'%(asctime)s | %(levelname)-7s | {CONFIG_NAME} | {RUN_ID} | %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+
+    stream = logging.StreamHandler(sys.stdout)
+    stream.setFormatter(fmt)
+    log.addHandler(stream)
+
+    # Best-effort file sink — a read-only or missing path must not kill the run.
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(LOG_DIR, f'{_safe_name(CONFIG_NAME)}.log')
+        rotating = logging.handlers.RotatingFileHandler(
+            path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+            encoding='utf-8',
+        )
+        rotating.setFormatter(fmt)
+        log.addHandler(rotating)
+        log.info('File logging enabled: %s', path)
+    except Exception as exc:  # noqa: BLE001 - logging must never be fatal
+        log.warning('File logging disabled (%s): %s', LOG_DIR, exc)
+
+    return log
+
+
+def write_run_report(result):
+    """Write the run's structured result as JSON for machine-readable history."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        path = os.path.join(
+            LOG_DIR, f'{_safe_name(CONFIG_NAME)}_{RUN_ID}.json'
+        )
+        with open(path, 'w', encoding='utf-8') as handle:
+            json.dump(result, handle, indent=2, default=str)
+        log.info('Run report written: %s', path)
+    except Exception as exc:  # noqa: BLE001
+        log.warning('Could not write run report: %s', exc)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +282,17 @@ def _instance_id(body):
 # ---------------------------------------------------------------------------
 # Configurable workflow processes (mstrio-py driven)
 # ---------------------------------------------------------------------------
+class WorkflowStepError(RuntimeError):
+    """Raised when a workflow step fails, carrying the partial step log so the
+    run report still shows which steps completed before the failure."""
+
+    def __init__(self, step_number, step_type, partial_results):
+        super().__init__(f'Workflow step {step_number} ({step_type}) failed')
+        self.step_number = step_number
+        self.step_type = step_type
+        self.partial_results = partial_results
+
+
 def _cfg(step, *names, required=False, default=None):
     """Read the first present, non-empty field from a step config (alias-tolerant)."""
     for name in names:
@@ -155,14 +309,25 @@ def _process_event_trigger(conn, step):
     return f'triggered event {event_id}'
 
 
-def _process_cache_invalidate(conn, step):
-    project_id = _cfg(step, 'projectID', 'project_id', required=True)
-    status = _cfg(step, 'status')  # None -> list_caches default ('ready')
-    list_kwargs = {'project_id': project_id}
+def _list_cache_ids(conn, project_id, status=None):
+    """List cache ids as raw dicts (to_dictionary=True).
+
+    Building ContentCache objects fails on cache source types the installed
+    enum doesn't know (e.g. 'docreport' -> CacheSource.Type ValueError), so we
+    stay in dict form and only pull the ids. Omitting status uses the library
+    default ('ready').
+    """
+    list_kwargs = {'project_id': project_id, 'to_dictionary': True}
     if status:
         list_kwargs['status'] = status
     caches = ContentCache.list_caches(conn, **list_kwargs)
-    cache_ids = [c.id for c in caches]
+    return [c['id'] for c in caches if c.get('id')]
+
+
+def _process_cache_invalidate(conn, step):
+    project_id = _cfg(step, 'projectID', 'project_id', required=True)
+    status = _cfg(step, 'status')
+    cache_ids = _list_cache_ids(conn, project_id, status)
     if cache_ids:
         ContentCache.invalidate_caches(conn, cache_ids=cache_ids)
     return f'invalidated {len(cache_ids)} cache(s) in project {project_id}'
@@ -171,12 +336,10 @@ def _process_cache_invalidate(conn, step):
 def _process_cache_delete(conn, step):
     project_id = _cfg(step, 'projectID', 'project_id', required=True)
     status = _cfg(step, 'status')
-    # project_id / status passed as **filters; force=True avoids a confirm prompt.
-    del_kwargs = {'project_id': project_id, 'force': True}
-    if status:
-        del_kwargs['status'] = status
-    ContentCache.delete_all_caches(conn, **del_kwargs)
-    return f'deleted caches in project {project_id}'
+    cache_ids = _list_cache_ids(conn, project_id, status)
+    if cache_ids:
+        ContentCache.delete_caches(conn, cache_ids=cache_ids, force=True)
+    return f'deleted {len(cache_ids)} cache(s) in project {project_id}'
 
 
 _PROCESS_HANDLERS = {
@@ -192,6 +355,9 @@ def run_workflow(conn, config_json):
     if not isinstance(steps, list):
         raise ValueError('WORKFLOW_CONFIG_JSON must be a JSON array of step objects')
 
+    total_steps = len(steps)
+    log.info('Workflow: %d step(s) configured', total_steps)
+
     results = []
     for i, step in enumerate(steps, start=1):
         ptype = step.get('type')
@@ -201,13 +367,34 @@ def run_workflow(conn, config_json):
                 f'Step {i}: unknown process type {ptype!r}. '
                 f'Valid types: {sorted(_PROCESS_HANDLERS)}'
             )
-        print(f'[workflow {i}/{len(steps)}] {ptype} ...')
-        detail = handler(conn, step)
+
+        log.info('[step %d/%d] %s starting — config: %s',
+                 i, total_steps, ptype, json.dumps(step))
+        started = time.monotonic()
+        try:
+            detail = handler(conn, step)
+        except Exception as exc:  # noqa: BLE001 - log which step failed, then re-raise
+            elapsed = round(time.monotonic() - started, 2)
+            log.exception('[step %d/%d] %s FAILED after %ss: %s',
+                          i, total_steps, ptype, elapsed, exc)
+            results.append({'step': i, 'type': ptype, 'status': 'error',
+                            'elapsed_seconds': elapsed, 'error': str(exc),
+                            'config': step})
+            raise WorkflowStepError(i, ptype, results) from exc
+
+        elapsed = round(time.monotonic() - started, 2)
+        log.info('[step %d/%d] %s OK in %ss — %s',
+                 i, total_steps, ptype, elapsed, detail)
+
         wait = int(_cfg(step, 'waitSeconds', 'wait_seconds', default=0) or 0)
-        print(f'    {detail}; waiting {wait}s before next step')
         if wait > 0:
+            log.info('[step %d/%d] waiting %ss before next step', i, total_steps, wait)
             time.sleep(wait)
-        results.append({'step': i, 'type': ptype, 'detail': detail, 'wait_seconds': wait})
+
+        results.append({'step': i, 'type': ptype, 'status': 'ok', 'detail': detail,
+                        'elapsed_seconds': elapsed, 'wait_seconds': wait})
+
+    log.info('Workflow complete: %d/%d step(s) succeeded', len(results), total_steps)
     return results
 
 
@@ -222,7 +409,8 @@ def get_dashboard_load_history(conn):
         endpoint=f'/api/dossiers/{DASHBOARD_ID}/instances',
     ).json()
     instance_id = _instance_id(created)
-    print(f'Dashboard instance: {instance_id} (status {created.get("status")})')
+    log.info('Dashboard %s instance %s (status %s)',
+             DASHBOARD_ID, instance_id, created.get('status'))
 
     # Get the visualization grid
     viz = _call(
@@ -236,7 +424,8 @@ def get_dashboard_load_history(conn):
 
     # Check the paging total before doing any work
     total = viz.get('data', {}).get('paging', {}).get('total', 0)
-    print(f'Visualization rows (data.paging.total): {total}')
+    log.info('Visualization %s/%s rows (data.paging.total): %s',
+             CHAPTER_KEY, VISUALIZATION_KEY, total)
     if total <= 0:
         return total, []
 
@@ -251,7 +440,7 @@ def get_dashboard_load_history(conn):
         )
 
     element_ids = [el['id'] for el in load_row.get('elements', []) if el.get('id')]
-    print(f'LoadHistoryID elements: {element_ids}')
+    log.info('%s elements (%d): %s', LOAD_HISTORY_ATTR_NAME, len(element_ids), element_ids)
     return total, element_ids
 
 
@@ -277,14 +466,14 @@ def poll_datamart_job(conn, instance_id):
         ).json()
         status = body.get('status')
         if status not in RUNNING_STATUSES:
-            print(f'Datamart job finished with status {status}')
+            log.info('Datamart job finished with status %s', status)
             return status, False
         if time.monotonic() >= deadline:
-            print(f'Datamart job still running (status {status}) after '
-                  f'{POLL_TIMEOUT_SECONDS}s — giving up on the wait')
+            log.warning('Datamart job still running (status %s) after %ss — '
+                        'giving up on the wait', status, POLL_TIMEOUT_SECONDS)
             return status, True
-        print(f'Datamart job running (status {status}); '
-              f'polling again in {POLL_INTERVAL_SECONDS}s...')
+        log.debug('Datamart job running (status %s); polling again in %ss',
+                  status, POLL_INTERVAL_SECONDS)
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -297,7 +486,8 @@ def run_datamart(conn, dashboard_element_ids):
         params={'offset': 0, 'limit': 1000, 'executionStage': 'resolve_prompts'},
     ).json()
     instance_id = _instance_id(created)
-    print(f'Datamart instance: {instance_id} (status {created.get("status")})')
+    log.info('Datamart %s instance %s (status %s)',
+             DATAMART_ID, instance_id, created.get('status'))
 
     # Read the prompt(s) on this instance
     prompts = _call(
@@ -325,7 +515,11 @@ def run_datamart(conn, dashboard_element_ids):
     answers = [{'id': el['id']} for el in elements if _element_key(el['id']) in dash_keys]
     matched_keys = {_element_key(el['id']) for el in elements if _element_key(el['id']) in dash_keys}
     unmatched = sorted(dash_keys - matched_keys)
-    print(f'Matched {len(answers)} prompt element(s); unmatched dashboard keys: {unmatched}')
+    log.info('Prompt %s: matched %d element(s); unmatched dashboard keys: %s',
+             prompt_id, len(answers), unmatched)
+    if unmatched:
+        log.warning('%d dashboard key(s) had no matching datamart prompt element: %s',
+                    len(unmatched), unmatched)
     if not answers:
         raise RuntimeError('No datamart prompt elements matched the dashboard IDs')
 
@@ -341,7 +535,8 @@ def run_datamart(conn, dashboard_element_ids):
         conn.post,
         endpoint=f'/api/datamarts/{DATAMART_ID}/instances/{instance_id}/execution/jobs',
     ).json()
-    print(f'Datamart job: {job.get("jobId")} (status {job.get("status")})')
+    log.info('Datamart job %s submitted (status %s)',
+             job.get('jobId'), job.get('status'))
 
     # Wait for the job to finish before cleaning up the instance
     final_status, timed_out = poll_datamart_job(conn, instance_id)
@@ -351,7 +546,7 @@ def run_datamart(conn, dashboard_element_ids):
         conn.delete,
         endpoint=f'/api/datamarts/{DATAMART_ID}/instances/{instance_id}',
     )
-    print('Datamart instance deleted.')
+    log.info('Datamart instance %s deleted', instance_id)
 
     return {
         'instance_id': instance_id,
@@ -366,18 +561,75 @@ def run_datamart(conn, dashboard_element_ids):
 
 
 # ---------------------------------------------------------------------------
+# Connection — retry/backoff for the wake-from-idle DNS race (see docstring)
+# ---------------------------------------------------------------------------
+def connect_with_retry():
+    """get_connection() with retry/backoff for transient connection failures.
+
+    A Planned Task has no live Workstation session to borrow from, so it must
+    independently authenticate via `connectionData` on every run. If the MCE
+    environment was idle and this trigger is what wakes it, the Library
+    service's internal DNS registration can lag behind the rest of the
+    environment coming up, and the first attempt fails with a
+    ConnectionError ("Name or service not known") before it's ready.
+
+    This retries ONLY that class of failure (connection/timeout errors), not
+    application-level errors (bad credentials, invalid project, etc.) — those
+    fail immediately as before. A genuinely wrong or permanently stale
+    connectionData host will still exhaust the retries and raise.
+    """
+    last_exc = None
+    for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
+        try:
+            conn = get_connection(connectionData, project_id=PROJECT_ID)  # noqa: F821
+            if attempt > 1:
+                log.info('Connected on attempt %d/%d', attempt, CONNECT_MAX_ATTEMPTS)
+            return conn
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+            if attempt == CONNECT_MAX_ATTEMPTS:
+                break
+            log.warning(
+                'Connection attempt %d/%d failed (%s); retrying in %ss — '
+                'environment may still be waking from idle',
+                attempt, CONNECT_MAX_ATTEMPTS, exc, CONNECT_RETRY_DELAY_SECONDS,
+            )
+            time.sleep(CONNECT_RETRY_DELAY_SECONDS)
+
+    log.error('Could not connect after %d attempt(s): %s', CONNECT_MAX_ATTEMPTS, last_exc)
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    conn = get_connection(workstationData)  # noqa: F821  (injected by Workstation)
-    conn.select_project(project_id=PROJECT_ID)
+    setup_logging()
+    started = time.monotonic()
 
-    result = {'project_id': PROJECT_ID, 'dashboard_id': DASHBOARD_ID,
-              'datamart_id': DATAMART_ID}
+    result = {
+        'config_name': CONFIG_NAME,
+        'run_id': RUN_ID,
+        'started_utc': datetime.now(timezone.utc).isoformat(),
+        'project_id': PROJECT_ID,
+        'dashboard_id': DASHBOARD_ID,
+        'datamart_id': DATAMART_ID,
+        'workflow_only': bool(WORKFLOW_ONLY),
+        'status': 'error',          # overwritten on success
+    }
+
+    log.info('=== ProjectTriggerWorkflow start === project=%s dashboard=%s '
+             'chapter=%s viz=%s datamart=%s workflow_only=%s',
+             PROJECT_ID, DASHBOARD_ID, CHAPTER_KEY, VISUALIZATION_KEY,
+             DATAMART_ID, WORKFLOW_ONLY)
+
     try:
+        conn = connect_with_retry()
+        log.info('Connected; project %s selected', PROJECT_ID)
+
         if WORKFLOW_ONLY:
             # Standalone: just run the configured workflow steps, no dashboard/datamart
-            print('WORKFLOW_ONLY=True — running configured workflow steps only')
+            log.info('WORKFLOW_ONLY is set — running configured workflow steps only')
             result['workflow'] = run_workflow(conn, WORKFLOW_CONFIG_JSON)
             result['action'] = 'workflow-only'
         else:
@@ -391,12 +643,40 @@ def main():
                 result['datamart'] = run_datamart(conn, element_ids)
                 result['action'] = 'executed'
             else:
+                log.info('No rows returned — workflow and datamart skipped')
                 result['action'] = 'skipped (no null load history)'
-    finally:
-        conn.close()
 
-    print(json.dumps(result, indent=2))
+        result['status'] = 'success'
+
+    except WorkflowStepError as exc:
+        # Keep the partial step log so the report shows what did complete
+        result['workflow'] = exc.partial_results
+        result['action'] = 'failed'
+        result['error'] = str(exc)
+        result['failed_step'] = {'number': exc.step_number, 'type': exc.step_type}
+        log.error('Run FAILED at workflow step %s (%s)', exc.step_number, exc.step_type)
+        raise
+    except Exception as exc:  # noqa: BLE001
+        result['action'] = 'failed'
+        result['error'] = str(exc)
+        log.exception('Run FAILED: %s', exc)
+        raise
+    finally:
+        result['elapsed_seconds'] = round(time.monotonic() - started, 2)
+        result['finished_utc'] = datetime.now(timezone.utc).isoformat()
+        log.info('=== ProjectTriggerWorkflow end === status=%s action=%s elapsed=%ss',
+                 result['status'], result.get('action'), result['elapsed_seconds'])
+        log.debug('Result: %s', json.dumps(result, indent=2, default=str))
+        write_run_report(result)
+
     return result
 
 
-main()
+# Called unconditionally: the host exec()s this script as a string, so a
+# `if __name__ == '__main__'` guard would not reliably fire.
+try:
+    main()
+except Exception:  # noqa: BLE001
+    # Non-zero exit so the MCE Planned Task is marked failed rather than
+    # silently "completed". The traceback is already in the log above.
+    sys.exit(1)
