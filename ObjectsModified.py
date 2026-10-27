@@ -5,21 +5,25 @@ List every object modified between two dates, across all loaded projects.
 
 Search
 ──────
-One metadata search per project (run in parallel), via
+One project-wide metadata search per project (run in parallel), via
 `start_full_search` → paged `get_search_results`:
   * domain = PROJECT
+  * object_types = every mstrio ObjectTypes value except Folder (8). A type
+             criterion is REQUIRED — with only a date range the I-Server
+             answers ERR006 "Please specify at least one object search
+             criteria". Config-level types just match nothing in PROJECT.
+             Folders are also dropped client-side as a safety net.
+  * begin/end_modification_time             (server-side date filter, UTC)
+  v2 only (I-Server ≥ 11.4.1200):
   * scope  = SearchScope.NOT_MANAGED_ONLY   (must be the enum — mstrio's
              `_scope_to_search_rest` calls `.name` on anything it doesn't
              match, so the string 'not_managed_only' raises AttributeError)
   * include_hidden = True                   (visibility=all)
-  * begin/end_modification_time             (server-side date filter, UTC)
-Scope and visibility are v2-search params (I-Server ≥ 11.4.1200); older
-servers get the v1 search, which drops them (mstrio logs a warning).
-
-Folders are dropped after the search, not in it: the REST `type` param is an
-include-list only (no "all but folders"), and `excludedFolders` skips folder
-*contents* by GUID rather than type-8 objects. Excluding server-side would
-mean enumerating every other type and silently losing any type not listed.
+  * exclude_folders                         (area narrowing, see Areas)
+On older servers (e.g. 11.3.x) the v1 search has none of these: hidden
+objects come back unfiltered, system-managed objects are NOT excluded, and
+areas are filtered client-side only. Logged once at startup; the v2 args are
+not passed at all, so mstrio doesn't warn on every search.
 
 Dates
 ─────
@@ -42,11 +46,12 @@ Default: all areas. `--areas Public Schema` limits output; `--exclude-profiles`
 drops Profile. Library shortcuts (type 18 / subtype 4609, one per user Library
 item, live in Profiles) can be dropped with `--exclude-library-shortcuts`.
 
-When the areas are narrowed, the filter is pushed into the search:
-  * Other selected     → one search, unselected area folders in `exclude_folders`
-  * Other not selected → one search per selected area, `root_id` = its folder
-Every row is still area-checked client-side (exclude_folders is v2-only and
-dropped on older servers).
+When the areas are narrowed (v2), the unselected area folders go into
+`exclude_folders`, so the server never scans them (Profiles is the big one).
+`root_id` is deliberately NOT used: mstrio validates a root via
+`conn.temporary_project_change()`, which switches the shared connection's
+project and races with the other project threads. 'Other' has no folder to
+exclude, so it is dropped client-side; every row is area-checked anyway.
 
 Output columns
 ──────────────
@@ -98,6 +103,7 @@ from mstrio.object_management.search_operations import (
 from mstrio.object_management.predefined_folders import PredefinedFolders
 from mstrio.server import Environment
 from mstrio.types import ObjectSubTypes, ObjectTypes
+from mstrio.utils.version_helper import meets_minimal_version
 
 from mstrio_core import (
     MstrConfig,
@@ -119,6 +125,15 @@ PAGE_SIZE = 1000
 
 FOLDER_TYPE = ObjectTypes.FOLDER.value                         # 8
 LIBRARY_SHORTCUT_SUBTYPE = ObjectSubTypes.LIBRARY_SHORTCUT.value  # 4609
+
+# The I-Server rejects a search with no name/type criterion (ERR006 "Please
+# specify at least one object search criteria") — a date range alone doesn't
+# count. So every known type except Folder is sent; configuration-level types
+# simply match nothing in the PROJECT domain.
+SEARCH_TYPES = sorted(t.value for t in ObjectTypes
+                      if t.value is not None and t.value > 0 and t.value != FOLDER_TYPE)
+
+V2_SEARCH_VERSION = '11.4.1200'  # scope / visibility / excludedFolders / includeSubfolders
 
 AREAS = ['Public', 'Schema', 'Profile', 'Other']
 
@@ -275,22 +290,15 @@ def _area(ancestors: list[dict], roots: dict[str, str]) -> str:
     return 'Other'
 
 
-def _search_plan(selected: set[str], roots: dict[str, str]) -> list[tuple[Optional[str], list[str]]]:
-    """Searches to run as [(root_id, exclude_folder_ids)].
+def _excluded_folders(selected: set[str], roots: dict[str, str]) -> list[str]:
+    """Top-level folder GUIDs of the unselected areas, for `exclude_folders`.
 
-    * all areas                → one project-wide search
-    * Other selected           → one search, unselected area roots excluded
-    * Other not selected       → one search per selected area, rooted at it
-                                 (falls back to the exclude form if a selected
-                                 area's GUID is unknown)
-    The client-side area check still runs on every row.
+    Narrowing is done by exclusion only, never `root_id`: given a root, mstrio
+    validates it via `conn.temporary_project_change()`, which switches the
+    shared connection's project and races with the other project threads.
+    'Other' has no folder to exclude, so its rows are dropped client-side.
     """
-    if selected >= set(AREAS):
-        return [(None, [])]
-    excluded = [roots[a] for a in AREAS if a not in selected and a in roots]
-    if 'Other' in selected or any(a not in roots for a in selected):
-        return [(None, excluded)]
-    return [(roots[a], []) for a in AREAS if a in selected]
+    return [roots[a] for a in AREAS if a not in selected and a in roots]
 
 
 def _fetch_ancestors(conn, project_id: str, object_id: str, type_id: int) -> list[dict]:
@@ -336,25 +344,30 @@ def _run_search(
     project,
     begin_utc: datetime,
     end_utc: datetime,
-    root_id: Optional[str],
     exclude: list[str],
+    v2: bool,
 ):
-    """Start one metadata search and yield its result dicts page by page."""
+    """Start one project-wide metadata search and yield its result dicts page
+    by page."""
+    # v2-only args are passed only when the server has v2 search; otherwise
+    # mstrio drops them and warns on every call (the gap is logged once in main).
+    v2_args = dict(
+        exclude_folders=exclude or None,
+        scope=SearchScope.NOT_MANAGED_ONLY,
+        include_hidden=True,
+    ) if v2 else {}
     search = start_full_search(
         conn,
         project=project.id,
         domain=SearchDomain.PROJECT,
-        root_id=root_id,
-        include_subfolders=True if root_id else None,
-        exclude_folders=exclude or None,
-        scope=SearchScope.NOT_MANAGED_ONLY,
-        include_hidden=True,
+        object_types=SEARCH_TYPES,
         begin_modification_time=_iso_z(begin_utc),
         end_modification_time=_iso_z(end_utc),
+        **v2_args,
     )
     search_id = search['id']
-    logger.debug('[{p}] search {sid} started (root={r}, excluded={x})',
-                 p=project.name, sid=search_id, r=root_id or 'project', x=exclude)
+    logger.debug('[{p}] search {sid} started (excluded={x})',
+                 p=project.name, sid=search_id, x=exclude)
 
     offset = 0
     while True:
@@ -379,67 +392,62 @@ def _search_project(
     end_utc: datetime,
     areas: set[str],
     exclude_library_shortcuts: bool,
+    v2: bool,
 ) -> tuple[list[dict], dict]:
     """Search one project; return (rows, counts)."""
-    counts = {'searches': 0, 'found': 0, 'folders': 0, 'shortcuts': 0,
-              'area': 0, 'window': 0, 'kept': 0}
+    counts = {'found': 0, 'folders': 0, 'shortcuts': 0, 'area': 0, 'window': 0, 'kept': 0}
 
     roots = _resolve_area_roots(conn, project)
-    plan = _search_plan(areas, roots)
-    logger.debug('[{p}] search plan: {plan}', p=project.name, plan=plan)
+    # v1 search has no excludedFolders — areas are then filtered client-side only
+    exclude = _excluded_folders(areas, roots) if v2 else []
+    logger.debug('[{p}] excluded folders: {x}', p=project.name, x=exclude)
 
     rows: list[dict] = []
-    seen: set[str] = set()
-    for root_id, exclude in plan:
-        counts['searches'] += 1
-        for obj in _run_search(conn, project, begin_utc, end_utc, root_id, exclude):
-            counts['found'] += 1
-            if obj.get('id') in seen:
-                continue
-            seen.add(obj.get('id'))
-            type_id = _int(obj.get('type'))
-            subtype_id = _int(obj.get('subtype'))
-            if type_id == FOLDER_TYPE:
-                counts['folders'] += 1
-                continue
-            if exclude_library_shortcuts and subtype_id == LIBRARY_SHORTCUT_SUBTYPE:
-                counts['shortcuts'] += 1
-                continue
+    for obj in _run_search(conn, project, begin_utc, end_utc, exclude, v2):
+        counts['found'] += 1
+        type_id = _int(obj.get('type'))
+        subtype_id = _int(obj.get('subtype'))
+        if type_id == FOLDER_TYPE:
+            counts['folders'] += 1
+            continue
+        if exclude_library_shortcuts and subtype_id == LIBRARY_SHORTCUT_SUBTYPE:
+            counts['shortcuts'] += 1
+            continue
 
-            modified = _parse_ts(obj.get('date_modified'))
-            if modified is not None and not (begin_utc <= modified < end_utc):
-                counts['window'] += 1
-                continue
+        modified = _parse_ts(obj.get('date_modified'))
+        if modified is not None and not (begin_utc <= modified < end_utc):
+            counts['window'] += 1
+            continue
 
-            ancestors = obj.get('ancestors')
-            if ancestors is None:
-                ancestors = _fetch_ancestors(conn, project.id, obj.get('id'), type_id)
-            area = _area(ancestors, roots)
-            if area not in areas:
-                counts['area'] += 1
-                continue
+        ancestors = obj.get('ancestors')
+        if ancestors is None:
+            ancestors = _fetch_ancestors(conn, project.id, obj.get('id'), type_id)
+        area = _area(ancestors, roots)
+        if area not in areas:
+            counts['area'] += 1
+            continue
 
-            owner = obj.get('owner') or {}
-            ext_type = _int(obj.get('ext_type'))
-            rows.append({
-                'project_id':          project.id,
-                'project_name':        project.name,
-                'object_id':           obj.get('id', ''),
-                'object_name':         obj.get('name', ''),
-                'object_type':         type_id if type_id is not None else '',
-                'object_type_name':    _type_name(type_id),
-                'object_subtype':      subtype_id if subtype_id is not None else '',
-                'object_subtype_name': _subtype_name(subtype_id),
-                'ext_type':            ext_type if ext_type is not None else '',
-                'area':                area,
-                'location':            object_location(ancestors) if ancestors else '',
-                'date_modified':       _fmt(modified, local=True),
-                'date_modified_utc':   _fmt(modified, local=False),
-                'date_created':        _fmt(_parse_ts(obj.get('date_created')), local=True),
-                'owner_id':            owner.get('id', ''),
-                'owner_name':          owner.get('name', ''),
-                'hidden':              bool(obj.get('hidden')),
-            })
+        owner = obj.get('owner') or {}
+        ext_type = _int(obj.get('ext_type'))
+        rows.append({
+            'project_id':          project.id,
+            'project_name':        project.name,
+            'object_id':           obj.get('id', ''),
+            'object_name':         obj.get('name', ''),
+            'object_type':         type_id if type_id is not None else '',
+            'object_type_name':    _type_name(type_id),
+            'object_subtype':      subtype_id if subtype_id is not None else '',
+            'object_subtype_name': _subtype_name(subtype_id),
+            'ext_type':            ext_type if ext_type is not None else '',
+            'area':                area,
+            'location':            object_location(ancestors) if ancestors else '',
+            'date_modified':       _fmt(modified, local=True),
+            'date_modified_utc':   _fmt(modified, local=False),
+            'date_created':        _fmt(_parse_ts(obj.get('date_created')), local=True),
+            'owner_id':            owner.get('id', ''),
+            'owner_name':          owner.get('name', ''),
+            'hidden':              bool(obj.get('hidden')),
+        })
 
     counts['kept'] = len(rows)
     return rows, counts
@@ -477,7 +485,16 @@ def main(
                 ls='excluded' if exclude_library_shortcuts else 'included')
 
     conn = get_mstrio_connection(config=config)
-    logger.info('I-Server version {v}', v=conn.iserver_version)
+    v2 = meets_minimal_version(conn.iserver_version, V2_SEARCH_VERSION)
+    logger.info('I-Server version {v} ({s} search)', v=conn.iserver_version,
+                s='v2' if v2 else 'v1')
+    if not v2:
+        logger.warning(
+            'I-Server {v} predates {req}: the v1 search has no scope or visibility '
+            'filter, so system-managed objects are NOT excluded and hidden objects '
+            'come back unfiltered; area narrowing runs client-side only',
+            v=conn.iserver_version, req=V2_SEARCH_VERSION,
+        )
 
     projects = _resolve_projects(conn, filter_projects)
     if not projects:
@@ -490,7 +507,7 @@ def main(
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
             pool.submit(_search_project, conn, p, begin_utc, end_utc,
-                        areas, exclude_library_shortcuts): p
+                        areas, exclude_library_shortcuts, v2): p
             for p in projects
         }
         for fut in as_completed(futures):
@@ -503,9 +520,9 @@ def main(
                              name=proj.name, id=proj.id, e=exc)
                 continue
             logger.info(
-                '[{name}] {kept} kept of {found} found in {n} search(es) '
+                '[{name}] {kept} kept of {found} found '
                 '(folders {f}, library shortcuts {s}, other areas {a}, outside window {w})',
-                name=proj.name, kept=c['kept'], found=c['found'], n=c['searches'], f=c['folders'],
+                name=proj.name, kept=c['kept'], found=c['found'], f=c['folders'],
                 s=c['shortcuts'], a=c['area'], w=c['window'],
             )
             all_rows.extend(rows)
