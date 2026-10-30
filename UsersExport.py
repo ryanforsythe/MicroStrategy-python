@@ -12,6 +12,7 @@ Output columns:
     email_address         – The user's DEFAULT email address
     created_ts            – Created timestamp (as the server returns it)
     modified_ts           – Last modified timestamp
+    description           – User description
     group_membership      – JSON array: [{"id": "...", "name": "..."}, ...]
 
 Usage:
@@ -49,7 +50,7 @@ from mstrio_core.config import MstrEnvironment
 ENVS = [e.value for e in MstrEnvironment]
 COLUMNS = ["base_url", "guid", "name", "id", "trusted_auth", "status",
            "standard_auth_enabled", "email_address", "created_ts", "modified_ts",
-           "group_membership"]
+           "description", "group_membership"]
 DEFAULT_CONCURRENCY = 10
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -90,7 +91,7 @@ def _timestamp(value) -> str:
 
 def _details(conn, user_id: str) -> dict:
     """Fetch the fields list_users() leaves out: status, standard auth, the
-    default email address and both timestamps.
+    default email address, both timestamps and the description.
 
     One GET /api/users/{id} covers all of them (mstrio's User._API_GETTERS maps
     them to the same getter). A failure for one user is logged and leaves that
@@ -106,11 +107,12 @@ def _details(conn, user_id: str) -> dict:
             "email_address": user.default_email_address or "",
             "created_ts": _timestamp(user.date_created),
             "modified_ts": _timestamp(user.date_modified),
+            "description": getattr(user, "description", None) or "",
         }
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not read details for user {uid}: {err}", uid=user_id, err=exc)
         return {"status": "", "standard_auth_enabled": "", "email_address": "",
-                "created_ts": "", "modified_ts": ""}
+                "created_ts": "", "modified_ts": "", "description": ""}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -138,8 +140,8 @@ def main(env: str, output_dir: Path | None = None,
         users = list_users(conn)
         logger.info("Retrieved {n} user(s).", n=len(users))
 
-        logger.info("Fetching status, standard auth, email and timestamps for "
-                    "{n} user(s) ({c} at a time)...", n=len(users), c=concurrency)
+        logger.info("Fetching status, standard auth, email, timestamps and description "
+                    "for {n} user(s) ({c} at a time)...", n=len(users), c=concurrency)
         with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
             details = list(pool.map(lambda u: _details(conn, u.id), users))
 
@@ -156,6 +158,7 @@ def main(env: str, output_dir: Path | None = None,
                 detail["email_address"],
                 detail["created_ts"],
                 detail["modified_ts"],
+                detail["description"],
                 _memberships_json(user),
             ])
         disabled = sum(1 for d in details if d["status"] == "Disabled")
