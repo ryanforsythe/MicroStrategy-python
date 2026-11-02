@@ -15,8 +15,9 @@ Output modes
                             JSON structure below).
 
 The CSV carries a few scalar settings (compression, formats, expiration, prompted)
-and leaves everything else to --format json: a JSON column would repeat on every
-recipient row and could not be edited back into one subscription.
+and the prompts with their answers as JSON in prompts_json. Everything else is left
+to --format json, which is also the file to edit: prompts_json repeats on every
+recipient row, so it is for reading and filtering.
 
 JSON structure
 ──────────────
@@ -93,6 +94,9 @@ Output columns
   format_types             Semicolon-separated content format types (PDF/EXCEL/…).
   expiration               Delivery expiration date.
   prompted                 True if any content has prompts enabled.
+  prompts_json             /subscriptions/{id}/prompts `prompts` array as JSON,
+                           with each prompt's `answers`; blank if not prompted,
+                           `ERROR: …` if the fetch failed.
 
 A subscription with no recipients (e.g. bursting to an address attribute) gets one
 row with the recipient columns blank.
@@ -184,6 +188,7 @@ COLUMNS = [
     'format_types',
     'expiration',
     'prompted',
+    'prompts_json',
 ]
 
 
@@ -327,6 +332,7 @@ def _flatten_subscription(
     project_id: str,
     project_name: str,
     addr_lookup: dict[str, dict[str, dict[str, str]]],
+    prompts_json: str = '',
 ) -> list[dict]:
     """
     Expand a raw subscription dict into one output row per recipient, or one
@@ -406,6 +412,7 @@ def _flatten_subscription(
             'format_types':           '; '.join(_personalization_values(sub, 'formatType')),
             'expiration':             _v(delivery, 'expiration'),
             'prompted':               _subscription_has_prompts(sub),
+            'prompts_json':           prompts_json,
         })
 
     return rows
@@ -473,6 +480,41 @@ class _ThreadConnections:
         self._all.clear()
 
 
+def _fetch_prompts(conn, pid: str, sub_id: str) -> tuple[list, str]:
+    """Return (prompts with saved answers, error text). A failure must be reported
+    by the caller, so a lost answer does not read as an unanswered prompt."""
+    try:
+        resp = subscriptions_api.get_subscription_prompts(
+            conn, subscription_id=sub_id, project_id=pid)
+        return resp.json().get('prompts') or [], ''
+    except Exception as exc:
+        logger.warning('Prompt fetch failed for {sid}: {e}', sid=sub_id, e=exc)
+        return [], str(exc)
+
+
+def _build_prompts_json(config, project_subs, concurrency) -> dict[tuple[str, str], str]:
+    """Return {(project_id, subscription_id): prompts_json cell} for prompted
+    subscriptions."""
+    targets = [
+        (pid, _v(sub, 'id'))
+        for pid, _pname, subs in project_subs
+        for sub in subs
+        if _subscription_has_prompts(sub)
+    ]
+    logger.info('Fetching prompts for {n} prompted subscription(s)...', n=len(targets))
+
+    def _fetch(target: tuple[str, str]) -> str:
+        prompts, error = _fetch_prompts(workers.get(), *target)
+        return f'ERROR: {error}' if error else json.dumps(prompts, ensure_ascii=False)
+
+    workers = _ThreadConnections(config)
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            return dict(zip(targets, pool.map(_fetch, targets)))
+    finally:
+        workers.close_all()
+
+
 def _fetch_definition(conn, pid: str, listed: dict) -> dict:
     """Fetch one subscription's full definition: the GET /subscriptions/{id} body,
     prompts with saved answers, and any dynamic recipient list definitions.
@@ -487,15 +529,9 @@ def _fetch_definition(conn, pid: str, listed: dict) -> dict:
         sub = dict(listed)
 
     if _subscription_has_prompts(sub):
-        try:
-            resp = subscriptions_api.get_subscription_prompts(
-                conn, subscription_id=sub_id, project_id=pid)
-            sub['prompts'] = resp.json().get('prompts') or []
-        except Exception as exc:
-            # In export_issues so a lost answer does not read as an unanswered prompt
-            logger.warning('Prompt fetch failed for {sid}: {e}', sid=sub_id, e=exc)
-            issues.append(f'prompt fetch failed: {exc}')
-            sub['prompts'] = []
+        sub['prompts'], error = _fetch_prompts(conn, pid, sub_id)
+        if error:
+            issues.append(f'prompt fetch failed: {error}')
 
     for rec in (sub.get('recipients') or []):
         if rec.get('type') != 'dynamic_recipient_list':
@@ -690,14 +726,19 @@ def main(
         print(f'\nExported: {out_file}  ({len(comprehensive)} subscriptions, {prompted} with prompts, {with_issues} with export_issues)')
     else:
         # Flat: one row per recipient.
+        prompts_cells = _build_prompts_json(config, project_subs, concurrency)
         all_rows: list[dict] = []
         for project_id, project_name, subs in project_subs:
             for sub in subs:
-                all_rows.extend(
-                    _flatten_subscription(sub, project_id, project_name, addr_lookup))
+                all_rows.extend(_flatten_subscription(
+                    sub, project_id, project_name, addr_lookup,
+                    prompts_cells.get((project_id, _v(sub, 'id')), '')))
+        failed = sum(1 for cell in prompts_cells.values() if cell.startswith('ERROR: '))
         logger.info(
-            'Total: {s} subscription(s) → {r} row(s) ({p} project(s))',
-            s=total_subs, r=len(all_rows), p=len(project_subs),
+            'Total: {s} subscription(s) → {r} row(s), {pr} prompted, {f} prompt '
+            'fetch(es) failed ({p} project(s))',
+            s=total_subs, r=len(all_rows), pr=len(prompts_cells), f=failed,
+            p=len(project_subs),
         )
         out_file = out_dir / CSV_FILENAME.format(env=env, ts=ts)
         csv_rows = [[r.get(c, '') for c in COLUMNS] for r in all_rows]
