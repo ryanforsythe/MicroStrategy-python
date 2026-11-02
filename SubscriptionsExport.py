@@ -42,7 +42,7 @@ snake_case keys leaves the REST body:
   recipients[].dynamic_recipient_list
                               Definition of a dynamic list recipient.
   resolved.owner_login
-  resolved.content_locations  {content id: folder path}
+  resolved.content_locations  {content id: folder path}, backslash-delimited
   resolved.personal_notification
                               Physical address of delivery.personalNotification.
   export_issues[]             Text notes on what a recreation must handle itself:
@@ -129,7 +129,7 @@ from mstrio.api import subscriptions as subscriptions_api
 from mstrio.server import Environment
 from mstrio.users_and_groups import User
 
-from mstrio_core import MstrConfig, get_mstrio_connection, object_location, write_csv
+from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
 from mstrio_core.config import MstrEnvironment
 
 # ── Workstation import (uncomment when running from Workstation) ──────────────
@@ -567,7 +567,10 @@ def _fetch_content_location(conn, pid: str, content_id: str, content_type: str) 
     try:
         resp = objects_api.get_object_info(conn, content_id, object_type, project_id=pid)
         if resp.ok:
-            return object_location(resp.json().get('ancestors') or [])
+            # Backslashes: a folder name can contain "/" (dev has "Central/Farnam").
+            # ancestors[0] is the project root.
+            ancestors = resp.json().get('ancestors') or []
+            return '\\'.join(a.get('name', '') for a in ancestors[1:])
         logger.warning('Location fetch failed for {cid}: HTTP {status}',
                        cid=content_id, status=resp.status_code)
     except Exception as exc:

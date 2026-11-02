@@ -1,12 +1,18 @@
 """
-SubscriptionsCreate.py — Create missing subscriptions from a Command Manager export.
+SubscriptionsCreate.py — Create missing subscriptions from an export.
 
-Input is the Command Manager subscription output, as CSV or Excel, with one row
-per recipient. Subscription GUIDs differ between environments, so a subscription
-is identified by ProjectGUID + Name. One that already exists is left alone.
+Two sources, chosen by the --input file extension:
+    .csv / .xlsx   Command Manager subscription output, one row per recipient.
+    .json          SubscriptionsExport.py --format json, one object per subscription.
+                   Edit that file to change what gets created; see "JSON source".
 
-Supported types:  Email, History List.
-Not built yet:    File — reported as `unsupported`, nothing is created.
+Subscription GUIDs differ between environments, so a subscription is identified
+by project + name. One that already exists is left alone.
+
+Supported types, Command Manager:  Email, History List. File is reported
+                                   `unsupported`, nothing is created.
+Supported types, JSON:             Email, History List, File, FTP, Cache. Shared
+                                   Link and Personal View are `unsupported`.
 
 Usage:
     python SubscriptionsCreate.py <env> --input PATH [--sheet NAME] [--apply]
@@ -15,10 +21,11 @@ Usage:
     python SubscriptionsCreate.py dev --input c:/tmp/subs.csv            # dry run
     python SubscriptionsCreate.py dev --input c:/tmp/subs.xlsx --sheet "Email"
     python SubscriptionsCreate.py prod --input c:/tmp/subs.xlsx --sheet "History List" --apply
+    python SubscriptionsCreate.py qa --input c:/tmp/subscriptions_export_dev.json
 
     Without --sheet, the first sheet of an Excel file is read.
 
-How each column is resolved (all names are case-insensitive):
+How each Command Manager column is resolved (all names are case-insensitive):
     Owner, Recipient   full user name, via one list_users() call. User(name=) is
                        not used: it raises when two users share the name. A shared
                        name is reported (`duplicate user name`) with each user's
@@ -34,6 +41,29 @@ How each column is resolved (all names are case-insensitive):
 Prompts: the input has no answers, so the `prompted` column marks each subscription
 as no / optional / required. `required` is not created (status `prompted`);
 `optional` is created and runs without answers.
+
+JSON source: the entry's own settings are posted as they are (delivery, format,
+compression, bursting, refresh conditions, allow* flags); GUIDs are looked up again
+on the target. `project_id` in the entry says which project to create in.
+    Owner, users       recipients[].login and resolved.owner_login, then the full
+                       name if no login is present. The exported GUID is ignored.
+    Groups, lists      user group or dynamic recipient list with the recipient's name.
+    Recipient address  addressName on that user, any delivery type; physical_address
+                       decides between two with the same name.
+    Content            resolved.content_locations folder + content name.
+    Schedule           schedule name, including hidden schedules.
+    Notification       personalNotification addressName among the owner's and the
+                       recipients' addresses. Not found: created without notification,
+                       and details says so.
+    Prompts            prompts[].answers are answered on a content instance, and the
+                       instance goes in the POST as personalization.prompt.instanceId.
+                       Subscription.answer_prompts() is not used: it rewrites contents
+                       with only format_type, which loses bursting and compression.
+                       The answers are read back after creating. A prompt with no
+                       saved answer uses its default; a required one is not created
+                       (status `prompted`).
+    Not created        a zip password is required (add delivery.<mode>.zip.password to
+                       the JSON to supply it), or the expiration date has passed.
 
 Dry run (the default) resolves everything and creates nothing. With --apply each
 subscription is created with sendNow=false: `Send Preview Now` is ignored, so
@@ -53,17 +83,25 @@ REST note:
 """
 
 import argparse
+import copy
 import csv
 import io
+import json
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
 
 from loguru import logger
-from mstrio.api import documents, reports
+from mstrio.api import documents, reports, subscriptions
 from mstrio.distribution_services import list_subscriptions
+from mstrio.distribution_services.subscription.dynamic_recipient_list import (
+    list_dynamic_recipient_lists,
+)
+from mstrio.modeling.prompt import Prompt
 from mstrio.object_management import full_search
-from mstrio.users_and_groups import User, list_users
+from mstrio.project_objects import Document, Report
+from mstrio.users_and_groups import User, list_user_groups, list_users
 from mstrio.utils.helper import is_dashboard
 
 from mstrio_core import (
@@ -107,6 +145,12 @@ SEND_CONTENT_AS = {
 }
 EXPIRATION_FORMATS = ["%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y", "%B %d, %Y"]
 CUBE_SUBTYPES = {776, 779}
+
+# delivery.mode → the delivery block of that mode, for the JSON source
+DELIVERY_BLOCKS = {"EMAIL": "email", "FILE": "file", "FTP": "ftp",
+                   "HISTORY_LIST": "historyList", "CACHE": "cache"}
+# Settings copied from an exported subscription; the rest is resolved or read-only
+EXPORT_SETTINGS = ["allowDeliveryChanges", "allowPersonalizationChanges", "allowUnsubscribe"]
 
 # ── Input ─────────────────────────────────────────────────────────────────────
 
@@ -201,11 +245,12 @@ def schedule_index(conn) -> dict[str, list[str]]:
     return index
 
 
-def fetch_addresses(conn, user_id: str) -> tuple[str, list[dict] | str]:
-    """(user id, [{id, name}] of email addresses), or an error message."""
+def fetch_addresses(conn, user_id: str, email_only: bool = True) -> tuple[str, list[dict] | str]:
+    """(user id, [{id, name, physical_address}] of its addresses), or an error message."""
     try:
-        return user_id, [{"id": a.id, "name": a.name} for a in User(conn, id=user_id).addresses or []
-                         if getattr(a.delivery_type, "value", "") == "email"]
+        return user_id, [{"id": a.id, "name": a.name, "physical_address": a.physical_address}
+                         for a in User(conn, id=user_id).addresses or []
+                         if not email_only or getattr(a.delivery_type, "value", "") == "email"]
     except Exception as exc:  # noqa: BLE001
         return user_id, f"could not read addresses: {exc}"
 
@@ -450,58 +495,411 @@ def process(session, group: list[dict], existing: set[str], users: dict, schedul
     return result("created", "; ".join(notes))
 
 
+# ── JSON source ───────────────────────────────────────────────────────────────
+
+
+def read_export(path: Path) -> list[dict]:
+    """The subscriptions of a SubscriptionsExport.py --format json file."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    subs = [data] if isinstance(data, dict) else data
+    for sub in subs:
+        missing = [k for k in ("project_id", "name", "contents", "delivery") if k not in sub]
+        if missing:
+            raise ValueError(f"{sub.get('name', '?')!r} is missing: {', '.join(missing)}")
+    return subs
+
+
+def _has_answer(prompt: dict) -> bool:
+    return prompt.get("answers") not in (None, "", [], {})
+
+
+def _is_prompted(sub: dict) -> bool:
+    return any(((c.get("personalization") or {}).get("prompt") or {}).get("enabled")
+               for c in sub["contents"])
+
+
+def export_user(login: str, name: str, lookups: dict) -> tuple[dict | None, tuple | None]:
+    """Resolve by login; by full name only when the export has no login."""
+    if not login:
+        return resolve_user(name, lookups["users"])
+    user = lookups["logins"].get(login.lower())
+    return (user, None) if user else (None, ("user not found", f"no user with login {login!r}"))
+
+
+def export_address(user_id: str, rec: dict, addresses: dict) -> tuple[str, tuple | None]:
+    """(target address id, problem) for a recipient's addressName."""
+    held = addresses.get(user_id, [])
+    if isinstance(held, str):
+        return "", ("error", held)
+    wanted = rec.get("addressName", "")
+    matches = [a for a in held if (a["name"] or "").strip().lower() == wanted.strip().lower()]
+    if len(matches) > 1:
+        matches = [a for a in matches
+                   if a["physical_address"] == rec.get("physical_address")] or matches
+    if len(matches) == 1:
+        return matches[0]["id"], None
+    status = "address not found" if not matches else "duplicate address name"
+    return "", (status, f"{len(matches)} address(es) named {wanted!r} on {rec.get('name')}")
+
+
+def export_recipients(sub: dict, lookups: dict) -> tuple[list[dict], list[tuple]]:
+    """(recipient dicts with target GUIDs, problems)."""
+    recipients, problems = [], []
+    for rec in sub.get("recipients") or []:
+        kind, name = rec.get("type", ""), rec.get("name", "")
+        recipient = {"type": kind, "includeType": rec.get("includeType", "TO")}
+        if kind == "user":
+            user, problem = export_user(rec.get("login", ""), name, lookups)
+            if problem:
+                problems.append(problem)
+                continue
+            recipient["id"] = user["id"]
+            if rec.get("addressId"):
+                recipient["addressId"], problem = export_address(user["id"], rec,
+                                                                 lookups["addresses"])
+                if problem:
+                    problems.append(problem)
+                    continue
+        elif kind in ("user_group", "dynamic_recipient_list"):
+            index = lookups["groups" if kind == "user_group" else "lists"]
+            ids = index.get(name.strip().lower(), [])
+            if len(ids) != 1:
+                problems.append(("recipient not found" if not ids else "duplicate recipient",
+                                 f"{len(ids)} {kind} named {name!r}"))
+                continue
+            recipient["id"] = ids[0]
+        else:
+            problems.append(("unsupported", f"recipient type {kind!r}"))
+            continue
+        recipients.append(recipient)
+    return recipients, problems
+
+
+def export_delivery(sub: dict, recipients: list[dict], owner: dict | None,
+                    addresses: dict) -> tuple[dict, str]:
+    """(delivery for the POST, note). Raises ValueError on an unusable value."""
+    delivery = copy.deepcopy(sub["delivery"])
+    block = delivery.get(DELIVERY_BLOCKS[delivery["mode"]]) or {}
+    zip_settings = block.get("zip") or {}
+    if zip_settings.get("passwordProtect") and not zip_settings.get("password"):
+        raise ValueError(f"no password in delivery.{DELIVERY_BLOCKS[delivery['mode']]}.zip")
+    _expiration(delivery.get("expiration") or "")
+
+    notification = delivery.get("personalNotification")
+    if not notification:
+        return delivery, ""
+    wanted = (notification.get("addressName") or "").strip().lower()
+    user_ids = {r["id"] for r in recipients if r["type"] == "user"} | ({owner["id"]} if owner else set())
+    found = {a["id"] for uid in user_ids if isinstance(addresses.get(uid), list)
+             for a in addresses[uid] if (a["name"] or "").strip().lower() == wanted}
+    if len(found) == 1:
+        delivery["personalNotification"] = {"addressId": found.pop()}
+        return delivery, ""
+    delivery.pop("personalNotification")
+    delivery.pop("notificationEnabled", None)
+    return delivery, f"{len(found)} notification address(es) named {wanted!r}; notification left off"
+
+
+def export_content(sub: dict, session, folders: dict) -> tuple[list[dict], list[tuple]]:
+    """([{id, type, source}] on the target, problems), matching on folder + name."""
+    locations = (sub.get("resolved") or {}).get("content_locations") or {}
+    found, problems = [], []
+    for source in sub["contents"]:
+        path = locations.get(source["id"], "")
+        if not path:
+            problems.append(("content not found", f"no folder for {source.get('name')!r}"))
+            continue
+        entry, problem = find_content(session, {"folder": path, "content": source.get("name", "")},
+                                      folders)
+        if problem:
+            problems.append(problem)
+        else:
+            found.append({"id": entry["id"], "type": content_type(entry), "source": source})
+    return found, problems
+
+
+def answered_instance(conn, content: dict, prompts: list[dict]) -> str:
+    """Answer the prompts on an instance of the content; its id goes in the POST."""
+    source = (Report if content["type"] == "report" else Document)(conn, content["id"])
+    answers = [Prompt(connection=conn, id=p.get("id"), key=p.get("key"), type=p.get("type"),
+                      answers=p.get("answers") if _has_answer(p) else None,
+                      use_default=not _has_answer(p)) for p in prompts]
+    if not source.answer_prompts(answers, force=True):
+        raise ValueError("the content did not ask for prompts on the target")
+    return source.instance_id
+
+
+def export_body(sub: dict, contents: list[dict], schedule_ids: list[str], owner_id: str,
+                recipients: list[dict], delivery: dict, instance_id: str | None) -> dict:
+    """The POST /api/subscriptions body."""
+    body_contents = []
+    for content in contents:
+        entry = {"id": content["id"], "type": content["type"]}
+        for key in ("personalization", "refreshCondition"):
+            if key in content["source"]:
+                entry[key] = copy.deepcopy(content["source"][key])
+        if instance_id:
+            entry["personalization"]["prompt"] = {"enabled": True, "instanceId": instance_id}
+        body_contents.append(entry)
+    return {
+        "multipleContents": len(body_contents) > 1,
+        "name": sub["name"],
+        **{key: sub[key] for key in EXPORT_SETTINGS if key in sub},
+        "sendNow": False,
+        "owner": {"id": owner_id},
+        "schedules": [{"id": schedule_id} for schedule_id in schedule_ids],
+        "contents": body_contents,
+        "recipients": recipients,
+        "delivery": delivery,
+    }
+
+
+def changed_prompts(conn, sub_id: str, project_id: str, prompts: list[dict]) -> list[str]:
+    """Titles of the prompts whose saved answers differ from the export."""
+    saved = subscriptions.get_subscription_prompts(
+        conn, subscription_id=sub_id, project_id=project_id).json().get("prompts") or []
+    answers = {p.get("id"): p.get("answers") for p in saved}
+    return [p.get("title", p.get("id")) for p in prompts
+            if _has_answer(p) and answers.get(p.get("id")) != p.get("answers")]
+
+
+def process_export(session, sub: dict, existing: set[str], lookups: dict, folders: dict,
+                   shared_name: bool, do_apply: bool) -> list:
+    """The result row for one exported subscription."""
+    project_id = sub["project_id"]
+    conn = session.mstrio_conn
+    mode = (sub["delivery"].get("mode") or "").upper()
+    resolved = sub.get("resolved") or {}
+    owner_name = (sub.get("owner") or {}).get("name", "")
+    prompts = sub.get("prompts") or []
+    found = {"content_id": "", "recipients": len(sub.get("recipients") or []), "new_id": "",
+             "prompted": (f"{sum(_has_answer(p) for p in prompts)}/{len(prompts)} answered"
+                          if prompts else "no")}
+
+    def result(status: str, details: str = "") -> list:
+        return [project_id, sub["name"], sub.get("id", ""), mode, owner_name,
+                "; ".join(c.get("name", "") for c in sub["contents"]), found["content_id"],
+                "; ".join(s.get("name", "") for s in sub.get("schedules") or []),
+                found["recipients"], found["prompted"], found["new_id"], status, details]
+
+    if sub["name"].strip().lower() in existing:
+        return result("exists", "already on target; not changed")
+    if mode not in DELIVERY_BLOCKS:
+        return result("unsupported", f"delivery mode {mode!r}")
+    if shared_name:
+        return result("error", "several subscriptions share this name in the project; "
+                               "project + name cannot tell them apart")
+
+    # Keep going after a problem, so one dry run shows everything to fix.
+    problems: list[tuple] = []
+
+    owner, problem = export_user(resolved.get("owner_login", ""), owner_name, lookups)
+    if problem:
+        problems.append(problem)
+
+    schedule_ids = []
+    for schedule in sub.get("schedules") or []:
+        ids = lookups["schedules"].get(schedule.get("name", "").strip().lower(), [])
+        if len(ids) == 1:
+            schedule_ids.append(ids[0])
+        else:
+            problems.append(("schedule not found" if not ids else "duplicate schedule",
+                             f"{len(ids)} schedule(s) named {schedule.get('name')!r}"))
+
+    recipients, recipient_problems = export_recipients(sub, lookups)
+    problems += recipient_problems
+    found["recipients"] = len(recipients)
+
+    contents, content_problems = export_content(sub, session, folders)
+    problems += content_problems
+    found["content_id"] = "; ".join(c["id"] for c in contents)
+
+    if _is_prompted(sub):
+        unanswered = [p for p in prompts if p.get("required") and not _has_answer(p)]
+        if not prompts:
+            problems.append(("prompted", "prompted, and the export has no prompts"))
+        elif unanswered:
+            problems.append(("prompted", f"{len(unanswered)} required prompt(s) have no "
+                                         "saved answer"))
+        if len(sub["contents"]) > 1 or any(c["type"] not in ("report", "document", "dossier")
+                                           for c in contents):
+            problems.append(("unsupported", "prompts on multiple contents or a cube"))
+
+    notes = []
+    try:
+        delivery, note = export_delivery(sub, recipients, owner, lookups["addresses"])
+        notes += [note] if note else []
+    except ValueError as exc:
+        problems.append(("not created", str(exc)))
+
+    if problems:
+        return result(problems[0][0], "; ".join(p[1] for p in problems + [("", n) for n in notes]))
+    if not do_apply:
+        return result("dry run", "; ".join(notes))
+
+    instance_id = None
+    if prompts:
+        try:
+            instance_id = answered_instance(conn, contents[0], prompts)
+        except Exception as exc:  # noqa: BLE001
+            return result("prompted", f"could not answer prompts, not created: {exc}")
+
+    body = export_body(sub, contents, schedule_ids, owner["id"], recipients, delivery, instance_id)
+    response = session.post("/subscriptions", json=body)
+    logger.debug("POST subscriptions {name}: {status}", name=sub["name"],
+                 status=response.status_code)
+    if not response.ok:
+        return result("error", f"HTTP {response.status_code}: {response.text[:300]}")
+
+    created = response.json()
+    found["new_id"] = created.get("id", "")
+    existing.add(sub["name"].strip().lower())
+    saved = {(r.get("id"), r.get("addressId")) for r in created.get("recipients") or []}
+    missing = [r for r in recipients if "addressId" in r and (r["id"], r["addressId"]) not in saved]
+    if missing:
+        notes.append(f"{len(missing)} address(es) not in the server's response")
+        return result("created, check recipients", "; ".join(notes))
+    if prompts:
+        try:
+            changed = changed_prompts(conn, found["new_id"], project_id, prompts)
+        except Exception as exc:  # noqa: BLE001
+            changed = [f"could not read them back: {exc}"]
+        if changed:
+            notes.append(f"answers differ: {', '.join(changed)}")
+            return result("created, check prompts", "; ".join(notes))
+    logger.info("Created {name} ({id})", name=sub["name"], id=found["new_id"])
+    return result("created", "; ".join(notes))
+
+
+def run_export(session, subs: list[dict], users: dict, schedules: dict, concurrency: int,
+               do_apply: bool) -> list[list]:
+    """Process a JSON source, one project at a time."""
+    conn = session.mstrio_conn
+    groups: dict[str, list[str]] = {}
+    for group in list_user_groups(conn, to_dictionary=True):
+        groups.setdefault((group.get("name") or "").strip().lower(), []).append(group["id"])
+    lookups = {"users": users, "schedules": schedules, "groups": groups, "lists": {},
+               "logins": {u["login"].lower(): u for matches in users.values()
+                          for u in matches if u["login"]}}
+
+    address_users = set()
+    for sub in subs:
+        people = [((sub.get("resolved") or {}).get("owner_login", ""),
+                   (sub.get("owner") or {}).get("name", ""))]
+        people += [(r.get("login", ""), r.get("name", "")) for r in sub.get("recipients") or []
+                   if r.get("type") == "user"]
+        for login, name in people:
+            user, _ = export_user(login, name, lookups)
+            if user:
+                address_users.add(user["id"])
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        lookups["addresses"] = dict(pool.map(
+            lambda uid: fetch_addresses(conn, uid, email_only=False), address_users))
+
+    name_counts = Counter((s["project_id"], s["name"].strip().lower()) for s in subs)
+    results: list[list] = []
+    for project_id in dict.fromkeys(s["project_id"] for s in subs):
+        project_subs = [s for s in subs if s["project_id"] == project_id]
+        try:
+            session.set_project(project_id=project_id)
+            existing = {(s.get("name") or "").strip().lower() for s in
+                        list_subscriptions(conn, project_id=project_id, to_dictionary=True)}
+            lookups["lists"] = {}
+            if any(r.get("type") == "dynamic_recipient_list" for s in project_subs
+                   for r in s.get("recipients") or []):
+                for entry in list_dynamic_recipient_lists(conn, project_id=project_id,
+                                                          to_dictionary=True):
+                    lookups["lists"].setdefault((entry.get("name") or "").strip().lower(),
+                                                []).append(entry["id"])
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Project {pid}: {exc}", pid=project_id, exc=exc)
+            results += [[project_id, s["name"], s.get("id", ""), s["delivery"].get("mode", ""),
+                         (s.get("owner") or {}).get("name", ""), "", "", "", "", "", "", "error",
+                         f"project unavailable: {exc}"] for s in project_subs]
+            continue
+
+        folders: dict = {}
+        for sub in project_subs:
+            shared = name_counts[(project_id, sub["name"].strip().lower())] > 1
+            try:
+                results.append(process_export(session, sub, existing, lookups, folders, shared,
+                                              do_apply))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("{name}: {exc}", name=sub["name"], exc=exc)
+                results.append([project_id, sub["name"], sub.get("id", ""),
+                                sub["delivery"].get("mode", ""),
+                                (sub.get("owner") or {}).get("name", ""), "", "", "", "", "", "",
+                                "error", str(exc)])
+    return results
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+
+def run_rows(session, groups: list[list[dict]], users: dict, schedules: dict, concurrency: int,
+             do_apply: bool) -> list[list]:
+    """Process a Command Manager source, one project at a time."""
+    conn = session.mstrio_conn
+    results: list[list] = []
+    address_users = {users[r["recipient"].lower()][0]["id"]
+                     for group in groups for r in group
+                     if r.get("recipientaddress")
+                     and len(users.get(r["recipient"].lower(), [])) == 1}
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        addresses = dict(pool.map(lambda uid: fetch_addresses(conn, uid), address_users))
+
+    for project_id in dict.fromkeys(g[0]["projectguid"] for g in groups):
+        project_groups = [g for g in groups if g[0]["projectguid"] == project_id]
+        try:
+            session.set_project(project_id=project_id)
+            existing = {(s.get("name") or "").strip().lower() for s in
+                        list_subscriptions(conn, project_id=project_id, to_dictionary=True)}
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Project {pid}: {exc}", pid=project_id, exc=exc)
+            results += [[project_id, g[0]["name"], g[0].get("guid", ""),
+                         g[0]["subscriptiontype"], g[0]["owner"], g[0]["content"], "",
+                         g[0]["schedule"], len(g), "", "", "error",
+                         f"project unavailable: {exc}"] for g in project_groups]
+            continue
+
+        folders: dict = {}
+        for group in project_groups:
+            try:
+                results.append(process(session, group, existing, users, schedules,
+                                       addresses, folders, do_apply))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("{name}: {exc}", name=group[0]["name"], exc=exc)
+                results.append([project_id, group[0]["name"], group[0].get("guid", ""),
+                                group[0]["subscriptiontype"], group[0]["owner"],
+                                group[0]["content"], "", group[0]["schedule"], len(group),
+                                "", "", "error", str(exc)])
+    return results
 
 
 def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = False,
          output_dir: Path | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> list[list]:
     config = MstrConfig(environment=MstrEnvironment(env))
-    groups = group_rows(read_input(input_path, sheet))
-    if not groups:
+    is_json = Path(input_path).suffix.lower() == ".json"
+    groups = [] if is_json else group_rows(read_input(input_path, sheet))
+    subs = read_export(input_path) if is_json else []
+    if not groups and not subs:
         raise ValueError(f"No usable rows in {input_path} — check the column names.")
-    logger.info("{n} subscription(s) from {path}; {mode}", n=len(groups), path=input_path,
+    logger.info("{n} subscription(s) from {path}; {mode}", n=len(subs or groups), path=input_path,
                 mode="APPLY" if do_apply else "DRY RUN — nothing will be changed")
 
-    results: list[list] = []
     with MstrRestSession(config) as session:
         conn = session.mstrio_conn
         users = user_index(conn)
         schedules = schedule_index(conn)
         logger.info("Indexed {u} user name(s), {s} schedule name(s).", u=len(users),
                     s=len(schedules))
-
-        address_users = {users[r["recipient"].lower()][0]["id"]
-                         for group in groups for r in group
-                         if r.get("recipientaddress")
-                         and len(users.get(r["recipient"].lower(), [])) == 1}
-        with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
-            addresses = dict(pool.map(lambda uid: fetch_addresses(conn, uid), address_users))
-
-        for project_id in dict.fromkeys(g[0]["projectguid"] for g in groups):
-            project_groups = [g for g in groups if g[0]["projectguid"] == project_id]
-            try:
-                session.set_project(project_id=project_id)
-                existing = {(s.get("name") or "").strip().lower() for s in
-                            list_subscriptions(conn, project_id=project_id, to_dictionary=True)}
-            except Exception as exc:  # noqa: BLE001
-                logger.error("Project {pid}: {exc}", pid=project_id, exc=exc)
-                results += [[project_id, g[0]["name"], g[0].get("guid", ""),
-                             g[0]["subscriptiontype"], g[0]["owner"], g[0]["content"], "",
-                             g[0]["schedule"], len(g), "", "", "error",
-                             f"project unavailable: {exc}"] for g in project_groups]
-                continue
-
-            folders: dict = {}
-            for group in project_groups:
-                try:
-                    results.append(process(session, group, existing, users, schedules,
-                                           addresses, folders, do_apply))
-                except Exception as exc:  # noqa: BLE001
-                    logger.error("{name}: {exc}", name=group[0]["name"], exc=exc)
-                    results.append([project_id, group[0]["name"], group[0].get("guid", ""),
-                                    group[0]["subscriptiontype"], group[0]["owner"],
-                                    group[0]["content"], "", group[0]["schedule"], len(group),
-                                    "", "", "error", str(exc)])
+        if is_json:
+            results = run_export(session, subs, users, schedules, concurrency, do_apply)
+        else:
+            results = run_rows(session, groups, users, schedules, concurrency, do_apply)
 
     counts: dict[str, int] = {}
     for result in results:
@@ -532,10 +930,11 @@ def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create missing subscriptions from a Command Manager export.")
+        description="Create missing subscriptions from a Command Manager or JSON export.")
     parser.add_argument("env", choices=ENVS, help="Environment to create them on.")
     parser.add_argument("--input", type=Path, required=True, metavar="PATH",
-                        help="CSV or Excel Command Manager output.")
+                        help="CSV or Excel Command Manager output, or "
+                             "SubscriptionsExport.py --format json output.")
     parser.add_argument("--sheet", default=None, metavar="NAME",
                         help="Excel sheet name (default: the first sheet).")
     parser.add_argument("--apply", action="store_true",
