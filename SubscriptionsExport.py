@@ -14,10 +14,12 @@ Output modes
                             to be edited and recreated on a target env (see
                             JSON structure below).
 
-The CSV carries a few scalar settings (compression, formats, expiration, prompted)
-and the prompts with their answers as JSON in prompts_json. Everything else is left
-to --format json, which is also the file to edit: prompts_json repeats on every
-recipient row, so it is for reading and filtering.
+  --format excel          : same rows and columns as csv, as .xlsx. Use this to edit:
+                            Excel reformats dates when it opens a CSV.
+
+The csv/excel output is also the working sheet for SubscriptionsCreate.py: filter
+with target_action, edit the visible columns. definition_json carries the full
+definition on every row (see JSON structure), so one file is enough.
 
 JSON structure
 ──────────────
@@ -97,6 +99,13 @@ Output columns
   prompts_json             /subscriptions/{id}/prompts `prompts` array as JSON,
                            with each prompt's `answers`; blank if not prompted,
                            `ERROR: …` if the fetch failed.
+  owner_login / recipient_login
+                           Logins; these match users on a target environment.
+  target_action            `Create`. Anything else makes SubscriptionsCreate.py
+                           skip that subscription.
+  definition_json          The JSON entry below, without prompts. Must fit an Excel
+                           cell (32,767 characters); an entry that does not is
+                           logged as an error.
 
 A subscription with no recipients (e.g. bursting to an address attribute) gets one
 row with the recipient columns blank.
@@ -129,7 +138,7 @@ from mstrio.api import subscriptions as subscriptions_api
 from mstrio.server import Environment
 from mstrio.users_and_groups import User
 
-from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
+from mstrio_core import MstrConfig, get_mstrio_connection, write_csv, write_excel
 from mstrio_core.config import MstrEnvironment
 
 # ── Workstation import (uncomment when running from Workstation) ──────────────
@@ -147,6 +156,8 @@ except ImportError:
 
 CSV_FILENAME  = 'subscriptions_export_{env}_{ts}.csv'
 JSON_FILENAME = 'subscriptions_export_{env}_{ts}.json'
+EXCEL_FILENAME = 'subscriptions_export_{env}_{ts}.xlsx'
+EXCEL_CELL_LIMIT = 32767
 DEFAULT_CONCURRENCY = 10
 
 # Group recipient types — no individual address to resolve
@@ -189,6 +200,10 @@ COLUMNS = [
     'expiration',
     'prompted',
     'prompts_json',
+    'owner_login',
+    'recipient_login',
+    'target_action',
+    'definition_json',
 ]
 
 
@@ -333,6 +348,7 @@ def _flatten_subscription(
     project_name: str,
     addr_lookup: dict[str, dict[str, dict[str, str]]],
     prompts_json: str = '',
+    definition_json: str = '',
 ) -> list[dict]:
     """
     Expand a raw subscription dict into one output row per recipient, or one
@@ -413,6 +429,10 @@ def _flatten_subscription(
             'expiration':             _v(delivery, 'expiration'),
             'prompted':               _subscription_has_prompts(sub),
             'prompts_json':           prompts_json,
+            'owner_login':            _v(sub.get('resolved') or {}, 'owner_login'),
+            'recipient_login':        _v(rec, 'login'),
+            'target_action':          'Create',
+            'definition_json':        definition_json,
         })
 
     return rows
@@ -492,27 +512,22 @@ def _fetch_prompts(conn, pid: str, sub_id: str) -> tuple[list, str]:
         return [], str(exc)
 
 
-def _build_prompts_json(config, project_subs, concurrency) -> dict[tuple[str, str], str]:
-    """Return {(project_id, subscription_id): prompts_json cell} for prompted
-    subscriptions."""
-    targets = [
-        (pid, _v(sub, 'id'))
-        for pid, _pname, subs in project_subs
-        for sub in subs
-        if _subscription_has_prompts(sub)
-    ]
-    logger.info('Fetching prompts for {n} prompted subscription(s)...', n=len(targets))
-
-    def _fetch(target: tuple[str, str]) -> str:
-        prompts, error = _fetch_prompts(workers.get(), *target)
-        return f'ERROR: {error}' if error else json.dumps(prompts, ensure_ascii=False)
-
-    workers = _ThreadConnections(config)
-    try:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            return dict(zip(targets, pool.map(_fetch, targets)))
-    finally:
-        workers.close_all()
+def _sheet_cells(sub: dict) -> tuple[str, str]:
+    """(prompts_json, definition_json) cells for one subscription."""
+    failed = [i for i in sub['export_issues'] if i.startswith('prompt fetch failed')]
+    if failed:
+        prompts_json = f'ERROR: {failed[0]}'
+    elif 'prompts' in sub:
+        prompts_json = json.dumps(sub['prompts'], ensure_ascii=False)
+    else:
+        prompts_json = ''
+    definition = {k: v for k, v in sub.items() if k != 'prompts'}
+    definition_json = json.dumps(definition, ensure_ascii=False, separators=(',', ':'))
+    for label, cell in (('definition_json', definition_json), ('prompts_json', prompts_json)):
+        if len(cell) > EXCEL_CELL_LIMIT:
+            logger.error('{col} of {name} ({sid}) is {n} characters, over the Excel cell limit',
+                         col=label, name=_v(sub, 'name'), sid=_v(sub, 'id'), n=len(cell))
+    return prompts_json, definition_json
 
 
 def _fetch_definition(conn, pid: str, listed: dict) -> dict:
@@ -692,12 +707,11 @@ def main(
         total_subs += len(subs)
 
         for sub in subs:
-            if fmt == 'json':  # owner login + personal notification address
-                recipient_user_ids.add(_v(sub.get('owner') or {}, 'id'))
+            # Owner too: login + personal notification address
+            recipient_user_ids.add(_v(sub.get('owner') or {}, 'id'))
             for rec in (sub.get('recipients') or []):
-                uid    = _v(rec, 'id')
-                addr_id = _v(rec, 'addressId', 'address_id')
-                if uid and (addr_id or fmt == 'json') and not _is_group_recipient(rec):
+                uid = _v(rec, 'id')
+                if uid and not _is_group_recipient(rec):
                     recipient_user_ids.add(uid)
 
     # ── PASS 2: resolve physical addresses ────────────────────────────────────
@@ -708,12 +722,12 @@ def main(
     ts = datetime.now().strftime('%Y%m%d_%H%M')
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Full definitions, prompt answers and resolved addresses, for every format.
+    comprehensive = _build_comprehensive(config, project_subs, addr_lookup, logins, concurrency)
+    prompted = sum(1 for s in comprehensive if s.get('prompts'))
+    with_issues = sum(1 for s in comprehensive if s['export_issues'])
+
     if fmt == 'json':
-        # Comprehensive: full nested definition + prompt answers + resolved addresses.
-        comprehensive = _build_comprehensive(
-            config, project_subs, addr_lookup, logins, concurrency)
-        prompted = sum(1 for s in comprehensive if s.get('prompts'))
-        with_issues = sum(1 for s in comprehensive if s['export_issues'])
         logger.info(
             'Total: {s} subscription(s), {pr} with prompts, {i} with export_issues '
             '({p} project(s))',
@@ -728,25 +742,24 @@ def main(
                        p=out_file, n=len(comprehensive), pr=prompted)
         print(f'\nExported: {out_file}  ({len(comprehensive)} subscriptions, {prompted} with prompts, {with_issues} with export_issues)')
     else:
-        # Flat: one row per recipient.
-        prompts_cells = _build_prompts_json(config, project_subs, concurrency)
+        # One row per recipient.
         all_rows: list[dict] = []
-        for project_id, project_name, subs in project_subs:
-            for sub in subs:
-                all_rows.extend(_flatten_subscription(
-                    sub, project_id, project_name, addr_lookup,
-                    prompts_cells.get((project_id, _v(sub, 'id')), '')))
-        failed = sum(1 for cell in prompts_cells.values() if cell.startswith('ERROR: '))
+        for sub in comprehensive:
+            all_rows.extend(_flatten_subscription(
+                sub, sub['project_id'], sub['project_name'], addr_lookup, *_sheet_cells(sub)))
         logger.info(
-            'Total: {s} subscription(s) → {r} row(s), {pr} prompted, {f} prompt '
-            'fetch(es) failed ({p} project(s))',
-            s=total_subs, r=len(all_rows), pr=len(prompts_cells), f=failed,
-            p=len(project_subs),
+            'Total: {s} subscription(s) → {r} row(s), {pr} with prompts, {i} with '
+            'export_issues ({p} project(s))',
+            s=total_subs, r=len(all_rows), pr=prompted, i=with_issues, p=len(project_subs),
         )
-        out_file = out_dir / CSV_FILENAME.format(env=env, ts=ts)
-        csv_rows = [[r.get(c, '') for c in COLUMNS] for r in all_rows]
-        write_csv(csv_rows, columns=COLUMNS, path=out_file)
-        logger.success('CSV written → {p}  ({n} rows)', p=out_file, n=len(all_rows))
+        sheet_rows = [[r.get(c, '') for c in COLUMNS] for r in all_rows]
+        if fmt == 'excel':
+            out_file = out_dir / EXCEL_FILENAME.format(env=env, ts=ts)
+            write_excel(sheet_rows, out_file, columns=COLUMNS, sheet_name='Subscriptions')
+        else:
+            out_file = out_dir / CSV_FILENAME.format(env=env, ts=ts)
+            write_csv(sheet_rows, columns=COLUMNS, path=out_file)
+        logger.success('Sheet written → {p}  ({n} rows)', p=out_file, n=len(all_rows))
         print(f'\nExported: {out_file}')
 
     return 0
@@ -760,8 +773,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=(
             'Export all MicroStrategy subscriptions across every loaded project. '
-            'CSV: one row per recipient, with physical delivery address resolved. '
-            'JSON: full definition with prompt answers, for recreation.'
+            'CSV/Excel: one row per recipient, the working sheet for SubscriptionsCreate.py. '
+            'JSON: one full definition per subscription.'
         )
     )
     parser.add_argument(
@@ -771,7 +784,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--format', '-f',
-        choices=['csv', 'json'],
+        choices=['csv', 'excel', 'json'],
         default='csv',
         dest='fmt',
         help='Output format (default: csv).',

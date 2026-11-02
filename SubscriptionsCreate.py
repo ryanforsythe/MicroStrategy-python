@@ -1,17 +1,20 @@
 """
 SubscriptionsCreate.py — Create missing subscriptions from an export.
 
-Two sources, chosen by the --input file extension:
-    .csv / .xlsx   Command Manager subscription output, one row per recipient.
+Three sources:
+    Sheet          SubscriptionsExport.py --format excel (or csv), one row per
+                   recipient. Filter and edit it; see "Working sheet".
     .json          SubscriptionsExport.py --format json, one object per subscription.
                    Edit that file to change what gets created; see "JSON source".
+    .csv / .xlsx   Command Manager subscription output, one row per recipient.
+                   Told apart from a sheet by its columns.
 
 Subscription GUIDs differ between environments, so a subscription is identified
 by project + name. One that already exists is left alone.
 
 Supported types, Command Manager:  Email, History List. File is reported
                                    `unsupported`, nothing is created.
-Supported types, JSON:             Email, History List, File, FTP, Cache. Shared
+Supported types, sheet and JSON:   Email, History List, File, FTP, Cache. Shared
                                    Link and Personal View are `unsupported`.
 
 Usage:
@@ -21,7 +24,9 @@ Usage:
     python SubscriptionsCreate.py dev --input c:/tmp/subs.csv            # dry run
     python SubscriptionsCreate.py dev --input c:/tmp/subs.xlsx --sheet "Email"
     python SubscriptionsCreate.py prod --input c:/tmp/subs.xlsx --sheet "History List" --apply
+    python SubscriptionsCreate.py qa --input c:/tmp/subscriptions_export_dev.xlsx
     python SubscriptionsCreate.py qa --input c:/tmp/subscriptions_export_dev.json
+    python SubscriptionsCreate.py qa --input c:/tmp/subscriptions_export_dev.json --subscription-id GUID
 
     Without --sheet, the first sheet of an Excel file is read.
 
@@ -41,6 +46,20 @@ How each Command Manager column is resolved (all names are case-insensitive):
 Prompts: the input has no answers, so the `prompted` column marks each subscription
 as no / optional / required. `required` is not created (status `prompted`);
 `optional` is created and runs without answers.
+
+Working sheet: rows with the same subscription_id are one subscription, built from
+definition_json with the sheet's edits on top, then handled as the JSON source below.
+    target_action      `Create` creates it; anything else, or deleting its rows, skips
+                       it. Excel's filter does not: hidden rows are still read.
+    Whole subscription subscription_name, project_id, owner_login, schedule_names
+                       (`;` between several), delivery_filename, email_subject,
+                       expiration, compressed, zip_filename, prompts_json.
+                       Rows that disagree on one of these mean it is not created.
+    Each row           recipient_login (recipient_name for a group), address_name,
+                       recipient_include_type. Copy a row to add a recipient, delete
+                       it to remove one.
+    Anything else      edit definition_json, on every row of the subscription.
+The results file lists the edits found in `changes`, so a dry run confirms them.
 
 JSON source: the entry's own settings are posted as they are (delivery, format,
 compression, bursting, refresh conditions, allow* flags); GUIDs are looked up again
@@ -121,7 +140,7 @@ DEFAULT_CONCURRENCY = 10
 
 COLUMNS = ["project_id", "subscription_name", "source_guid", "subscription_type",
            "owner", "content", "content_id", "schedule", "recipients", "prompted",
-           "new_subscription_id", "status", "details"]
+           "new_subscription_id", "status", "details", "changes"]
 DUPLICATE_COLUMNS = ["full_name", "user_guid", "login"]
 
 REQUIRED_COLUMNS = ["projectguid", "name", "content", "folder", "schedule",
@@ -188,12 +207,16 @@ def read_input(path: Path, sheet: str | None = None) -> list[dict]:
 
     rows = [{_key(header): str(value or "").strip() for header, value in raw.items() if header}
             for raw in raw_rows]
-    rows = [row for row in rows if row.get("name")]
     if rows:
+        if "definitionjson" in rows[0]:
+            return rows
+        if "subscriptionid" in rows[0]:
+            raise ValueError("This SubscriptionsExport.py output has no definition_json "
+                             "column. Export again with --format excel.")
         missing = [c for c in REQUIRED_COLUMNS if c not in rows[0]]
         if missing:
             raise ValueError(f"Input is missing column(s): {', '.join(missing)}")
-    return rows
+    return [row for row in rows if row.get("name")]
 
 
 def group_rows(rows: list[dict]) -> list[list[dict]]:
@@ -495,6 +518,160 @@ def process(session, group: list[dict], existing: set[str], users: dict, schedul
     return result("created", "; ".join(notes))
 
 
+# ── Working sheet ─────────────────────────────────────────────────────────────
+
+
+def _one_value(rows: list[dict], column: str) -> str:
+    """The value all rows of a subscription share. Raises ValueError if they differ."""
+    values = {row.get(column, "") for row in rows}
+    if len(values) > 1:
+        raise ValueError(f"rows disagree on {column}")
+    return values.pop()
+
+
+def apply_compression(sub: dict, block: dict, rows: list[dict], changes: list[str]) -> None:
+    """Apply the compressed + zip_filename columns."""
+    was = bool(block.get("zip")) or any((c.get("personalization") or {}).get("compressed")
+                                        for c in sub["contents"])
+    old_name = (block.get("zip") or {}).get("filename", "")
+    value = _one_value(rows, "compressed").lower()
+    now = value in ("true", "yes", "y", "1") if value else was
+    name = _one_value(rows, "zipfilename")
+    if now == was and (not now or name == old_name):
+        return
+    changes.append(f"compressed: {was} → {now}" if now != was
+                   else f"zip filename: {old_name} → {name}")
+    for content in sub["contents"]:
+        content.setdefault("personalization", {})["compressed"] = now
+    if now:
+        block.setdefault("zip", {})["filename"] = (name or block.get("filename") or sub["name"])
+    else:
+        block.pop("zip", None)
+
+
+def apply_recipients(sub: dict, rows: list[dict], changes: list[str]) -> None:
+    """Rebuild sub["recipients"] from the rows: each row keeps its exported recipient,
+    found by recipient_id + address_id, with the row's edits on top."""
+    originals = {(r.get("id", ""), r.get("addressId", "")): r
+                 for r in sub.get("recipients") or []}
+    recipients, seen, used = [], set(), set()
+    for row in rows:
+        key = (row.get("recipientid", ""), row.get("addressid", ""))
+        login, name = row.get("recipientlogin", ""), row.get("recipientname", "")
+        if not (key[0] or login or name):
+            continue  # a subscription with no recipients
+        base = originals.get(key)
+        used.add(key)
+        recipient = dict(base or {"type": row.get("recipienttype") or "user"})
+        recipient["includeType"] = (row.get("recipientincludetype")
+                                    or recipient.get("includeType", "TO"))
+        if recipient["type"] == "user":
+            if base is None:
+                changes.append(f"added recipient {login or name}")
+            elif login != base.get("login", ""):
+                changes.append(f"recipient: {base.get('login', '')} → {login}")
+                recipient.pop("physical_address", None)
+            recipient["login"] = login
+        elif base is None or name != base.get("name", ""):
+            changes.append(f"recipient: {(base or {}).get('name', '')} → {name}")
+        recipient["name"] = name or recipient.get("name", "")
+
+        address = row.get("addressname", "")
+        if address != recipient.get("addressName", ""):
+            changes.append(f"address of {login or name}: "
+                           f"{recipient.get('addressName', '')} → {address}")
+            recipient["addressName"] = address
+            recipient.pop("physical_address", None)
+            if address:
+                recipient["addressId"] = "from sheet"  # resolved by name on the target
+            else:
+                recipient.pop("addressId", None)
+
+        identity = (recipient.get("login") or recipient["name"].lower(),
+                    recipient.get("addressName", ""))
+        if identity not in seen:
+            seen.add(identity)
+            recipients.append(recipient)
+
+    changes += [f"removed recipient {r.get('login') or r.get('name')}"
+                for key, r in originals.items() if key not in used]
+    sub["recipients"] = recipients
+
+
+def apply_sheet_edits(sub: dict, rows: list[dict]) -> list[str]:
+    """Apply a subscription's rows to its definition; returns the changes found.
+    Raises ValueError on an unusable edit."""
+    changes: list[str] = []
+
+    def edit(column: str, label: str, old: str, assign) -> None:
+        new = _one_value(rows, column)
+        if new != (old or ""):
+            changes.append(f"{label}: {old} → {new}")
+            assign(new)
+
+    resolved = sub.setdefault("resolved", {})
+    delivery = sub["delivery"]
+    block = delivery.get(DELIVERY_BLOCKS.get(delivery.get("mode"), "")) or {}
+
+    edit("subscriptionname", "name", sub["name"], lambda v: sub.update(name=v))
+    edit("projectid", "project", sub["project_id"], lambda v: sub.update(project_id=v))
+    edit("ownerlogin", "owner", resolved.get("owner_login", ""),
+         lambda v: resolved.update(owner_login=v))
+    edit("deliveryfilename", "filename", block.get("filename", ""),
+         lambda v: block.update(filename=v))
+    edit("emailsubject", "subject", block.get("subject", ""), lambda v: block.update(subject=v))
+
+    def set_expiration(value: str) -> None:
+        delivery.pop("expiration", None)
+        if value:
+            delivery["expiration"] = _expiration(value)
+
+    edit("expiration", "expiration", delivery.get("expiration", ""), set_expiration)
+
+    old_schedules = [s.get("name", "") for s in sub.get("schedules") or []]
+    new_schedules = [n.strip() for n in _one_value(rows, "schedulenames").split(";") if n.strip()]
+    if new_schedules != old_schedules:
+        changes.append(f"schedule: {'; '.join(old_schedules)} → {'; '.join(new_schedules)}")
+        sub["schedules"] = [{"name": name} for name in new_schedules]
+
+    apply_compression(sub, block, rows, changes)
+    apply_recipients(sub, rows, changes)
+
+    prompts = _one_value(rows, "promptsjson")
+    if prompts.startswith("ERROR"):
+        raise ValueError(prompts)
+    if prompts:
+        sub["prompts"] = json.loads(prompts)
+    return changes
+
+
+def subs_from_sheet(rows: list[dict]) -> list[dict]:
+    """One definition per subscription_id, edits applied. `sheet_status` holds a
+    (status, details) when the subscription is skipped or its rows are unusable."""
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("subscriptionid"):
+            grouped.setdefault(row["subscriptionid"], []).append(row)
+
+    subs = []
+    for sub_id, group in grouped.items():
+        actions = {r.get("targetaction", "").lower() for r in group}
+        sub = {"id": sub_id, "project_id": group[0].get("projectid", ""),
+               "name": group[0].get("subscriptionname", ""), "contents": [], "delivery": {}}
+        try:
+            sub = json.loads(_one_value(group, "definitionjson"))
+            if actions == {"create"}:
+                sub["sheet_changes"] = "; ".join(apply_sheet_edits(sub, group))
+            elif "create" in actions:
+                sub["sheet_status"] = ("error", "rows disagree on target_action")
+            else:
+                sub["sheet_status"] = ("skipped", f"target_action {group[0].get('targetaction')!r}")
+        except ValueError as exc:
+            sub["sheet_status"] = ("error", str(exc))
+        subs.append(sub)
+    return subs
+
+
 # ── JSON source ───────────────────────────────────────────────────────────────
 
 
@@ -670,7 +847,6 @@ def process_export(session, sub: dict, existing: set[str], lookups: dict, folder
                    shared_name: bool, do_apply: bool) -> list:
     """The result row for one exported subscription."""
     project_id = sub["project_id"]
-    conn = session.mstrio_conn
     mode = (sub["delivery"].get("mode") or "").upper()
     resolved = sub.get("resolved") or {}
     owner_name = (sub.get("owner") or {}).get("name", "")
@@ -683,8 +859,12 @@ def process_export(session, sub: dict, existing: set[str], lookups: dict, folder
         return [project_id, sub["name"], sub.get("id", ""), mode, owner_name,
                 "; ".join(c.get("name", "") for c in sub["contents"]), found["content_id"],
                 "; ".join(s.get("name", "") for s in sub.get("schedules") or []),
-                found["recipients"], found["prompted"], found["new_id"], status, details]
+                found["recipients"], found["prompted"], found["new_id"], status, details,
+                sub.get("sheet_changes", "")]
 
+    if sub.get("sheet_status"):
+        return result(*sub["sheet_status"])
+    conn = session.mstrio_conn
     if sub["name"].strip().lower() in existing:
         return result("exists", "already on target; not changed")
     if mode not in DELIVERY_BLOCKS:
@@ -776,8 +956,11 @@ def process_export(session, sub: dict, existing: set[str], lookups: dict, folder
 
 def run_export(session, subs: list[dict], users: dict, schedules: dict, concurrency: int,
                do_apply: bool) -> list[list]:
-    """Process a JSON source, one project at a time."""
+    """Process a sheet or JSON source, one project at a time."""
     conn = session.mstrio_conn
+    results = [process_export(session, s, set(), {}, {}, False, False)
+               for s in subs if s.get("sheet_status")]
+    subs = [s for s in subs if not s.get("sheet_status")]
     groups: dict[str, list[str]] = {}
     for group in list_user_groups(conn, to_dictionary=True):
         groups.setdefault((group.get("name") or "").strip().lower(), []).append(group["id"])
@@ -800,7 +983,6 @@ def run_export(session, subs: list[dict], users: dict, schedules: dict, concurre
             lambda uid: fetch_addresses(conn, uid, email_only=False), address_users))
 
     name_counts = Counter((s["project_id"], s["name"].strip().lower()) for s in subs)
-    results: list[list] = []
     for project_id in dict.fromkeys(s["project_id"] for s in subs):
         project_subs = [s for s in subs if s["project_id"] == project_id]
         try:
@@ -880,11 +1062,19 @@ def run_rows(session, groups: list[list[dict]], users: dict, schedules: dict, co
 
 
 def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = False,
-         output_dir: Path | None = None, concurrency: int = DEFAULT_CONCURRENCY) -> list[list]:
+         output_dir: Path | None = None, concurrency: int = DEFAULT_CONCURRENCY,
+         subscription_ids: list[str] | None = None) -> list[list]:
     config = MstrConfig(environment=MstrEnvironment(env))
     is_json = Path(input_path).suffix.lower() == ".json"
-    groups = [] if is_json else group_rows(read_input(input_path, sheet))
-    subs = read_export(input_path) if is_json else []
+    rows = [] if is_json else read_input(input_path, sheet)
+    is_sheet = bool(rows) and "definitionjson" in rows[0]
+    if subscription_ids and not (is_json or is_sheet):
+        raise ValueError("--subscription-id does not apply to Command Manager input.")
+    groups = group_rows(rows) if rows and not is_sheet else []
+    subs = read_export(input_path) if is_json else subs_from_sheet(rows) if is_sheet else []
+    if subscription_ids:
+        wanted = {guid.upper() for guid in subscription_ids}
+        subs = [s for s in subs if str(s.get("id", "")).upper() in wanted]
     if not groups and not subs:
         raise ValueError(f"No usable rows in {input_path} — check the column names.")
     logger.info("{n} subscription(s) from {path}; {mode}", n=len(subs or groups), path=input_path,
@@ -896,7 +1086,7 @@ def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = 
         schedules = schedule_index(conn)
         logger.info("Indexed {u} user name(s), {s} schedule name(s).", u=len(users),
                     s=len(schedules))
-        if is_json:
+        if subs:
             results = run_export(session, subs, users, schedules, concurrency, do_apply)
         else:
             results = run_rows(session, groups, users, schedules, concurrency, do_apply)
@@ -909,6 +1099,7 @@ def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = 
     stamp = f"{datetime.now():%Y%m%d_%H%M}"
     out_dir = Path(output_dir or config.output_dir)
     out_path = out_dir / f"subscriptions_create_{env}_{stamp}.csv"
+    results = [result + [""] * (len(COLUMNS) - len(result)) for result in results]
     write_csv(results, columns=COLUMNS, path=out_path)
 
     # Every shared name the input uses, so they can all be renamed in one pass.
@@ -930,13 +1121,16 @@ def main(env: str, input_path: Path, sheet: str | None = None, do_apply: bool = 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Create missing subscriptions from a Command Manager or JSON export.")
+        description="Create missing subscriptions from an edited SubscriptionsExport.py sheet "
+                    "or JSON, or a Command Manager export.")
     parser.add_argument("env", choices=ENVS, help="Environment to create them on.")
     parser.add_argument("--input", type=Path, required=True, metavar="PATH",
-                        help="CSV or Excel Command Manager output, or "
-                             "SubscriptionsExport.py --format json output.")
+                        help="SubscriptionsExport.py sheet (--format excel/csv) or --format "
+                             "json output, or CSV/Excel Command Manager output.")
     parser.add_argument("--sheet", default=None, metavar="NAME",
                         help="Excel sheet name (default: the first sheet).")
+    parser.add_argument("--subscription-id", nargs="+", default=None, metavar="GUID",
+                        help="Sheet or JSON input: create just these source subscriptions.")
     parser.add_argument("--apply", action="store_true",
                         help="Create the subscriptions (default: dry run).")
     parser.add_argument("--output-dir", type=Path, default=None, metavar="PATH",
@@ -947,4 +1141,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     main(env=args.env, input_path=args.input, sheet=args.sheet, do_apply=args.apply,
-         output_dir=args.output_dir, concurrency=args.concurrency)
+         output_dir=args.output_dir, concurrency=args.concurrency,
+         subscription_ids=args.subscription_id)
