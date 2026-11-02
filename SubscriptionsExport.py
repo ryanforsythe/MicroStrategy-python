@@ -10,15 +10,46 @@ can be sorted or filtered by user, delivery mode, schedule, etc.
 Output modes
 ────────────
   --format csv  (default) : flat, one row per recipient (see columns below).
-  --format json           : COMPREHENSIVE — one full nested object per
-                            subscription (raw definition: contents +
-                            personalization, delivery, recipients, schedules),
-                            with each non-group recipient enriched with its
-                            resolved physical_address / device_id / device_name,
-                            AND for prompted subscriptions the prompt definitions
-                            + saved answers from /subscriptions/{id}/prompts.
-                            The per-prompt `key` + `answers` are what a recreation
-                            step needs to re-apply answers on a target env.
+  --format json           : COMPREHENSIVE — one object per subscription, built
+                            to be edited and recreated on a target env (see
+                            JSON structure below).
+
+The CSV carries a few scalar settings (compression, formats, expiration, prompted)
+and leaves everything else to --format json: a JSON column would repeat on every
+recipient row and could not be edited back into one subscription.
+
+JSON structure
+──────────────
+The file is a list. Each entry is the unchanged GET /subscriptions/{id} response,
+which is the POST /subscriptions body shape: name, allow*, owner, schedules, contents
+(+ personalization: formatType, compressed, bursting, exportToPdfSettings,
+delimiter, prompt; + refreshCondition), recipients, and delivery (mode, expiration,
+expirationTimeZone, contactSecurity, notificationEnabled, personalNotification and
+the mode's block, e.g. delivery.email.zip). Compression is in two places:
+contents[].personalization.compressed and delivery.<mode>.zip.
+
+Keys the export adds are snake_case, REST keys are camelCase, so dropping the
+snake_case keys leaves the REST body:
+  project_id / project_name
+  last_run                    From the list call; GET does not return it.
+  prompts[]                   Prompted subscriptions only: definition + saved
+                              `answers`, from /subscriptions/{id}/prompts. `key` +
+                              `answers` re-apply through answer_prompts().
+  recipients[].login          Plus physical_address / device_id / device_name
+                              (not on groups). GUIDs may differ between
+                              environments; these match on the target.
+  recipients[].dynamic_recipient_list
+                              Definition of a dynamic list recipient.
+  resolved.owner_login
+  resolved.content_locations  {content id: folder path}
+  resolved.personal_notification
+                              Physical address of delivery.personalNotification.
+  export_issues[]             Text notes on what a recreation must handle itself:
+                              a zip password (never returned by the API), an
+                              expiration date in the past, an address that did not
+                              resolve, a failed fetch. Empty = nothing to handle.
+Read-only REST keys a POST does not take: id, editable, dateCreated, dateModified,
+recipients[].childSubscriptionId, schedules[].nextDelivery / expired.
 
 Address resolution
 ──────────────────
@@ -56,6 +87,15 @@ Output columns
                            ContactAddress.device); blank for groups. Join key
                            to the device → GoAnywhere mapping.
   device_name              Device name backing the recipient's address.
+  compressed               True if any content or the delivery is zipped.
+  zip_filename             delivery.<mode>.zip filename.
+  zip_password_protected   delivery.<mode>.zip passwordProtect.
+  format_types             Semicolon-separated content format types (PDF/EXCEL/…).
+  expiration               Delivery expiration date.
+  prompted                 True if any content has prompts enabled.
+
+A subscription with no recipients (e.g. bursting to an address attribute) gets one
+row with the recipient columns blank.
 
 Connection
 ──────────
@@ -73,16 +113,19 @@ Usage
 
 import argparse
 import json
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from loguru import logger
+from mstrio.api import objects as objects_api
+from mstrio.api import subscriptions as subscriptions_api
 from mstrio.server import Environment
 from mstrio.users_and_groups import User
 
-from mstrio_core import MstrConfig, get_mstrio_connection, write_csv
+from mstrio_core import MstrConfig, get_mstrio_connection, object_location, write_csv
 from mstrio_core.config import MstrEnvironment
 
 # ── Workstation import (uncomment when running from Workstation) ──────────────
@@ -93,11 +136,6 @@ try:
 except ImportError:
     list_subscriptions = None
 
-try:
-    # Per-subscription prompt definitions + saved answers (for comprehensive JSON)
-    from mstrio.api.subscriptions import get_subscription_prompts
-except ImportError:
-    get_subscription_prompts = None
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
@@ -109,6 +147,9 @@ DEFAULT_CONCURRENCY = 10
 
 # Group recipient types — no individual address to resolve
 _GROUP_TYPES = {'usergroup', 'user_group', 'contactgroup', 'contact_group', 'group'}
+
+# Subscription content type → metadata object type (a cube is a report definition)
+_CONTENT_OBJECT_TYPES = {'report': 3, 'cube': 3, 'document': 55, 'dossier': 55}
 
 COLUMNS = [
     'project_id',
@@ -137,13 +178,20 @@ COLUMNS = [
     'physical_address',
     'device_id',
     'device_name',
+    'compressed',
+    'zip_filename',
+    'zip_password_protected',
+    'format_types',
+    'expiration',
+    'prompted',
 ]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  RAW-DICT HELPERS
-#  list_subscriptions(to_dictionary=True) returns raw camelCase API dicts.
-#  Helpers below accept both camelCase and snake_case defensively.
+#  list_subscriptions(to_dictionary=True) snake_cases dict keys but not those
+#  inside lists (contents, recipients stay camelCase); GET /subscriptions/{id} is
+#  camelCase throughout. Helpers below accept both.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _v(d: dict, *keys, default: str = '') -> str:
@@ -185,6 +233,22 @@ def _delivery_fields(delivery: dict) -> tuple[str, str, str]:
     return mode, filename, subject
 
 
+def _mode_settings(delivery: dict) -> dict:
+    """Return the block of the delivery mode (delivery.email, delivery.file, …)."""
+    mode_key = (_v(delivery, 'mode') or '').lower()
+    camel_key = mode_key.replace('_l', 'L')  # history_list → historyList
+    return delivery.get(mode_key) or delivery.get(camel_key) or {}
+
+
+def _personalization_values(sub: dict, key: str) -> list:
+    """Return the non-empty values of a personalization key across contents."""
+    values = (
+        (c.get('personalization') or {}).get(key)
+        for c in (sub.get('contents') or [])
+    )
+    return [v for v in values if v]
+
+
 def _is_group_recipient(rec: dict) -> bool:
     """Return True if this recipient is a group (no per-user address to resolve)."""
     if rec.get('isGroup') or rec.get('is_group'):
@@ -201,23 +265,25 @@ def _build_address_lookup(
     conn,
     user_ids: set[str],
     concurrency: int,
-) -> dict[str, dict[str, str]]:
+) -> tuple[dict[str, dict[str, dict[str, str]]], dict[str, str]]:
     """
-    Fetch ContactAddresses for every user_id in parallel.
+    Fetch login and ContactAddresses for every user_id in parallel.
 
     Returns:
-        {user_id: {address_id: {"physical_address", "device_id", "device_name"}}}
+        ({user_id: {address_id: {"physical_address", "device_id", "device_name"}}},
+         {user_id: login})
     """
     if not user_ids:
-        return {}
+        return {}, {}
 
     logger.info(
         'Resolving addresses for {n} unique recipient user(s)...', n=len(user_ids),
     )
 
     lookup: dict[str, dict[str, dict[str, str]]] = {}
+    logins: dict[str, str] = {}
 
-    def _fetch(uid: str) -> tuple[str, dict[str, dict[str, str]]]:
+    def _fetch(uid: str) -> tuple[str, str, dict[str, dict[str, str]]]:
         try:
             user = User(conn, id=uid)
             addrs: dict[str, dict[str, str]] = {}
@@ -228,26 +294,28 @@ def _build_address_lookup(
                     'device_id':        dev.id if dev else '',
                     'device_name':      dev.name if dev else '',
                 }
-            return uid, addrs
+            return uid, user.username, addrs
         except Exception as exc:
             logger.warning(
                 'Could not fetch addresses for user {uid}: {err}', uid=uid, err=exc,
             )
-            return uid, {}
+            return uid, '', {}
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {pool.submit(_fetch, uid): uid for uid in user_ids}
         done = 0
         for future in as_completed(futures):
-            uid, addrs = future.result()
+            uid, login, addrs = future.result()
             if addrs:
                 lookup[uid] = addrs
+            if login:
+                logins[uid] = login
             done += 1
             if done % 50 == 0:
                 logger.debug('  Address lookup: {done}/{total}', done=done, total=len(user_ids))
 
     logger.info('Address lookup complete ({n} user(s) resolved)', n=len(lookup))
-    return lookup
+    return lookup, logins
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,7 +329,8 @@ def _flatten_subscription(
     addr_lookup: dict[str, dict[str, dict[str, str]]],
 ) -> list[dict]:
     """
-    Expand a raw subscription dict into one output row per recipient.
+    Expand a raw subscription dict into one output row per recipient, or one
+    row with blank recipient columns if it has none.
     Resolves physical_address, device_id, device_name from addr_lookup.
     """
     sub_id   = _v(sub, 'id')
@@ -282,17 +351,15 @@ def _flatten_subscription(
 
     delivery = sub.get('delivery') or {}
     mode, filename, subject = _delivery_fields(delivery)
+    zip_settings = _mode_settings(delivery).get('zip') or {}
+    compressed   = bool(zip_settings or _personalization_values(sub, 'compressed'))
 
     date_created  = _fmt_dt(_v(sub, 'dateCreated',  'date_created'))
     date_modified = _fmt_dt(_v(sub, 'dateModified', 'date_modified'))
     last_run      = _fmt_dt(_v(sub, 'lastRun',      'last_run'))
 
-    recipients = sub.get('recipients') or []
-    if not recipients:
-        return []
-
     rows = []
-    for rec in recipients:
+    for rec in (sub.get('recipients') or [{}]):
         rec_id   = _v(rec, 'id')
         addr_id  = _v(rec, 'addressId',   'address_id')
         addr_nm  = _v(rec, 'addressName', 'address_name')
@@ -333,6 +400,12 @@ def _flatten_subscription(
             'physical_address':       phys,
             'device_id':              device_id,
             'device_name':            device_name,
+            'compressed':             compressed,
+            'zip_filename':           _v(zip_settings, 'filename'),
+            'zip_password_protected': _v(zip_settings, 'passwordProtect', 'password_protect'),
+            'format_types':           '; '.join(_personalization_values(sub, 'formatType')),
+            'expiration':             _v(delivery, 'expiration'),
+            'prompted':               _subscription_has_prompts(sub),
         })
 
     return rows
@@ -351,8 +424,8 @@ def _subscription_has_prompts(sub: dict) -> bool:
     return False
 
 
-def _enrich_recipient_addresses(sub: dict, addr_lookup: dict) -> None:
-    """Add resolved physical_address / device_id / device_name onto each
+def _enrich_recipients(sub: dict, addr_lookup: dict, logins: dict) -> None:
+    """Add login + resolved physical_address / device_id / device_name onto each
     non-group recipient dict (in place)."""
     for rec in (sub.get('recipients') or []):
         if _is_group_recipient(rec):
@@ -360,59 +433,157 @@ def _enrich_recipient_addresses(sub: dict, addr_lookup: dict) -> None:
         uid     = _v(rec, 'id')
         addr_id = _v(rec, 'addressId', 'address_id')
         info = (addr_lookup.get(uid) or {}).get(addr_id) or {}
+        if addr_id and not info:
+            sub['export_issues'].append(f'address {addr_id} of recipient {uid} not found')
+        rec['login']            = logins.get(uid, '')
         rec['physical_address'] = info.get('physical_address', '')
         rec['device_id']        = info.get('device_id', '')
         rec['device_name']      = info.get('device_name', '')
 
 
-def _build_comprehensive(conn, project_subs, addr_lookup, concurrency) -> list[dict]:
-    """Build one full nested object per subscription: the raw definition plus
-    resolved recipient addresses and, for prompted subscriptions, the prompt
-    definitions + saved answers from /subscriptions/{id}/prompts.
+class _ThreadConnections:
+    """One logged-in Connection (= one I-Server session) per worker thread.
 
-    The prompt `key` + `answers` captured here are what a recreation step needs
-    to re-apply answers on the target environment.
+    Reading prompts creates messages in the session's working set: parallel reads
+    on a shared session evict each other, and they fail intermittently with ERR004
+    "Message not found in user history list".
     """
-    # Which subscriptions are prompted (limit the extra REST calls)
-    prompt_targets: list[tuple[str, str]] = []
-    if get_subscription_prompts is not None:
-        for pid, _pname, subs in project_subs:
-            for sub in subs:
-                if _subscription_has_prompts(sub):
-                    sid = _v(sub, 'id')
-                    if sid:
-                        prompt_targets.append((pid, sid))
 
-    prompts_map: dict[tuple[str, str], list] = {}
-    if prompt_targets:
-        logger.info('Fetching prompt answers for {n} prompted subscription(s)...',
-                    n=len(prompt_targets))
+    def __init__(self, config: MstrConfig):
+        self._config = config
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._all: list = []
 
-        def _fetch(pid: str, sid: str):
+    def get(self):
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = get_mstrio_connection(config=self._config)
+            self._local.conn = conn
+            with self._lock:
+                self._all.append(conn)
+        return conn
+
+    def close_all(self) -> None:
+        for conn in self._all:
             try:
-                resp = get_subscription_prompts(conn, subscription_id=sid, project_id=pid)
-                return (pid, sid), (resp.json().get('prompts') or [])
+                conn.close()
             except Exception as exc:
-                logger.warning('Prompt fetch failed for {sid}: {e}', sid=sid, e=exc)
-                return (pid, sid), []
+                logger.warning('Worker logout failed: {e}', e=exc)
+        self._all.clear()
 
+
+def _fetch_definition(conn, pid: str, listed: dict) -> dict:
+    """Fetch one subscription's full definition: the GET /subscriptions/{id} body,
+    prompts with saved answers, and any dynamic recipient list definitions.
+    A failed fetch keeps what the list call returned and adds to export_issues."""
+    sub_id = _v(listed, 'id')
+    issues: list[str] = []
+    try:
+        sub = subscriptions_api.get_subscription(conn, sub_id, pid).json()
+    except Exception as exc:
+        logger.warning('Definition fetch failed for {sid}: {e}', sid=sub_id, e=exc)
+        issues.append(f'definition fetch failed, list data used: {exc}')
+        sub = dict(listed)
+
+    if _subscription_has_prompts(sub):
+        try:
+            resp = subscriptions_api.get_subscription_prompts(
+                conn, subscription_id=sub_id, project_id=pid)
+            sub['prompts'] = resp.json().get('prompts') or []
+        except Exception as exc:
+            # In export_issues so a lost answer does not read as an unanswered prompt
+            logger.warning('Prompt fetch failed for {sid}: {e}', sid=sub_id, e=exc)
+            issues.append(f'prompt fetch failed: {exc}')
+            sub['prompts'] = []
+
+    for rec in (sub.get('recipients') or []):
+        if rec.get('type') != 'dynamic_recipient_list':
+            continue
+        try:
+            rec['dynamic_recipient_list'] = subscriptions_api.get_dynamic_recipient_list(
+                conn, rec['id'], pid).json()
+        except Exception as exc:
+            logger.warning('Dynamic recipient list fetch failed for {rid}: {e}',
+                           rid=rec['id'], e=exc)
+            issues.append(f"dynamic recipient list {rec['id']} fetch failed: {exc}")
+
+    delivery = sub.get('delivery') or {}
+    if (_mode_settings(delivery).get('zip') or {}).get('passwordProtect'):
+        issues.append('zip password protected: the API does not return the password')
+    expiration = delivery.get('expiration')
+    if expiration and date.fromisoformat(expiration[:10]) < date.today():
+        issues.append(f'expiration {expiration} is in the past')
+
+    last_run = _v(listed, 'lastRun', 'last_run')
+    if last_run:
+        sub['last_run'] = _fmt_dt(last_run)
+    sub['export_issues'] = issues
+    return sub
+
+
+def _fetch_content_location(conn, pid: str, content_id: str, content_type: str) -> str:
+    """Return a content's folder path, or blank if it cannot be read."""
+    object_type = _CONTENT_OBJECT_TYPES.get(content_type)
+    if object_type is None:
+        logger.warning('Unknown content type {t} for {cid}', t=content_type, cid=content_id)
+        return ''
+    try:
+        resp = objects_api.get_object_info(conn, content_id, object_type, project_id=pid)
+        if resp.ok:
+            return object_location(resp.json().get('ancestors') or [])
+        logger.warning('Location fetch failed for {cid}: HTTP {status}',
+                       cid=content_id, status=resp.status_code)
+    except Exception as exc:
+        logger.warning('Location fetch failed for {cid}: {e}', cid=content_id, e=exc)
+    return ''
+
+
+def _build_comprehensive(config, project_subs, addr_lookup, logins, concurrency) -> list[dict]:
+    """Build one recreation-ready object per subscription. See "JSON structure"
+    in the module docstring: REST body unchanged, additions in snake_case keys."""
+    listed = [(pid, pname, sub) for pid, pname, subs in project_subs for sub in subs]
+    logger.info('Fetching full definitions for {n} subscription(s)...', n=len(listed))
+
+    workers = _ThreadConnections(config)
+    try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [pool.submit(_fetch, pid, sid) for pid, sid in prompt_targets]
-            for fut in as_completed(futures):
-                key, prompts = fut.result()
-                prompts_map[key] = prompts
+            definitions = list(pool.map(
+                lambda item: _fetch_definition(workers.get(), item[0], item[2]), listed))
+
+            content_keys = {
+                (pid, c['id'], c.get('type'))
+                for (pid, _pname, _sub), definition in zip(listed, definitions)
+                for c in (definition.get('contents') or [])
+            }
+            logger.info('Resolving folders for {n} distinct content object(s)...',
+                        n=len(content_keys))
+            locations = dict(zip(content_keys, pool.map(
+                lambda key: _fetch_content_location(workers.get(), *key), content_keys)))
+    finally:
+        workers.close_all()
+
+    addresses = {
+        addr_id: info
+        for user_addrs in addr_lookup.values()
+        for addr_id, info in user_addrs.items()
+    }
 
     out: list[dict] = []
-    for pid, pname, subs in project_subs:
-        for sub in subs:
-            sub = dict(sub)  # shallow copy; we add a few keys
-            sub.setdefault('project_id', pid)
-            sub.setdefault('project_name', pname)
-            _enrich_recipient_addresses(sub, addr_lookup)
-            prompts = prompts_map.get((pid, _v(sub, 'id')))
-            if prompts is not None:
-                sub['prompts'] = prompts
-            out.append(sub)
+    for (pid, pname, _sub), sub in zip(listed, definitions):
+        sub['project_id'] = pid
+        sub['project_name'] = pname
+        _enrich_recipients(sub, addr_lookup, logins)
+        notification = (sub.get('delivery') or {}).get('personalNotification') or {}
+        sub['resolved'] = {
+            'owner_login': logins.get(_v(sub.get('owner') or {}, 'id'), ''),
+            'content_locations': {
+                c['id']: locations.get((pid, c['id'], c.get('type')), '')
+                for c in (sub.get('contents') or [])
+            },
+            'personal_notification': addresses.get(notification.get('addressId'), {}),
+        }
+        out.append(sub)
     return out
 
 
@@ -482,26 +653,32 @@ def main(
         total_subs += len(subs)
 
         for sub in subs:
+            if fmt == 'json':  # owner login + personal notification address
+                recipient_user_ids.add(_v(sub.get('owner') or {}, 'id'))
             for rec in (sub.get('recipients') or []):
                 uid    = _v(rec, 'id')
                 addr_id = _v(rec, 'addressId', 'address_id')
-                if uid and addr_id and not _is_group_recipient(rec):
+                if uid and (addr_id or fmt == 'json') and not _is_group_recipient(rec):
                     recipient_user_ids.add(uid)
 
     # ── PASS 2: resolve physical addresses ────────────────────────────────────
-    addr_lookup = _build_address_lookup(conn, recipient_user_ids, concurrency)
+    recipient_user_ids.discard('')
+    addr_lookup, logins = _build_address_lookup(conn, recipient_user_ids, concurrency)
 
     # ── OUTPUT ────────────────────────────────────────────────────────────────
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts = datetime.now().strftime('%Y%m%d_%H%M')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if fmt == 'json':
         # Comprehensive: full nested definition + prompt answers + resolved addresses.
-        comprehensive = _build_comprehensive(conn, project_subs, addr_lookup, concurrency)
+        comprehensive = _build_comprehensive(
+            config, project_subs, addr_lookup, logins, concurrency)
         prompted = sum(1 for s in comprehensive if s.get('prompts'))
+        with_issues = sum(1 for s in comprehensive if s['export_issues'])
         logger.info(
-            'Total: {s} subscription(s), {pr} with prompt answers ({p} project(s))',
-            s=total_subs, pr=prompted, p=len(project_subs),
+            'Total: {s} subscription(s), {pr} with prompts, {i} with export_issues '
+            '({p} project(s))',
+            s=total_subs, pr=prompted, i=with_issues, p=len(project_subs),
         )
         out_file = out_dir / JSON_FILENAME.format(env=env, ts=ts)
         out_file.write_text(
@@ -510,7 +687,7 @@ def main(
         )
         logger.success('Comprehensive JSON written → {p}  ({n} subscriptions, {pr} prompted)',
                        p=out_file, n=len(comprehensive), pr=prompted)
-        print(f'\nExported: {out_file}  ({len(comprehensive)} subscriptions, {prompted} with prompt answers)')
+        print(f'\nExported: {out_file}  ({len(comprehensive)} subscriptions, {prompted} with prompts, {with_issues} with export_issues)')
     else:
         # Flat: one row per recipient.
         all_rows: list[dict] = []
@@ -539,7 +716,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description=(
             'Export all MicroStrategy subscriptions across every loaded project. '
-            'One row per recipient, with physical delivery address resolved.'
+            'CSV: one row per recipient, with physical delivery address resolved. '
+            'JSON: full definition with prompt answers, for recreation.'
         )
     )
     parser.add_argument(
@@ -573,7 +751,7 @@ if __name__ == '__main__':
         type=int,
         default=DEFAULT_CONCURRENCY,
         metavar='N',
-        help=f'Parallel workers for address resolution (default: {DEFAULT_CONCURRENCY}).',
+        help=f'Parallel workers for API lookups (default: {DEFAULT_CONCURRENCY}).',
     )
 
     args = parser.parse_args()
