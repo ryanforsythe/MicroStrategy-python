@@ -76,6 +76,7 @@ on the target. `project_id` in the entry says which project to create in.
                        and details says so.
     Prompts            prompts[].answers are answered on a content instance, and the
                        instance goes in the POST as personalization.prompt.instanceId.
+                       Answering repeats while prompts are open, for cascading ones.
                        Subscription.answer_prompts() is not used: it rewrites contents
                        with only format_type, which loses bursting and compression.
                        The answers are read back after creating. A prompt with no
@@ -117,9 +118,7 @@ from mstrio.distribution_services import list_subscriptions
 from mstrio.distribution_services.subscription.dynamic_recipient_list import (
     list_dynamic_recipient_lists,
 )
-from mstrio.modeling.prompt import Prompt
 from mstrio.object_management import full_search
-from mstrio.project_objects import Dashboard, Document, Report
 from mstrio.users_and_groups import User, list_user_groups, list_users
 from mstrio.utils.helper import is_dashboard
 
@@ -798,19 +797,60 @@ def export_content(sub: dict, session, folders: dict) -> tuple[list[dict], list[
     return found, problems
 
 
-def answered_instance(conn, content: dict, prompts: list[dict]) -> str:
-    """Answer the prompts on an instance of the content; its id goes in the POST."""
-    # By keyword: the second positional is id on Report, but name on Document
-    source_class = {"report": Report, "document": Document, "dossier": Dashboard}[content["type"]]
-    source = source_class(conn, id=content["id"])
-    # No connection: with one, Prompt fetches the prompt as its own object, and an
-    # embedded prompt has none (ERR004); before 11.4.0600 it raises instead
-    answers = [Prompt(id=p.get("id"), key=p.get("key"), type=p.get("type"),
-                      answers=p.get("answers") if _has_answer(p) else None,
-                      use_default=not _has_answer(p)) for p in prompts]
-    if not source.answer_prompts(answers, force=True):
-        raise ValueError("the content did not ask for prompts on the target")
-    return source.instance_id
+def _body(response, step: str) -> dict | list:
+    """The JSON of a REST response; raises ValueError naming the step on an error
+    status. An empty body (204, or 202 while the content runs) is {}."""
+    if not response.ok:
+        raise ValueError(f"{step}: HTTP {response.status_code} {response.text[:300]}")
+    return response.json() if response.content.strip() else {}
+
+
+def answered_instance(session, content: dict, prompts: list[dict]) -> str:
+    """Answer the exported prompts on a new instance of the content; the instance id
+    goes in the POST. Plain REST rather than mstrio's answer_prompts(), which reads
+    every response as JSON and fails on an empty one.
+
+    Answering can open more prompts (a cascading prompt shows up once the one it
+    depends on is answered), so it repeats until none are open. A prompt that is not
+    in the export uses its default."""
+    # (create path, body, prompts path). /v2/documents and /v2/dossiers instances 404
+    # on 11.3; resolveOnly stops a document at its prompts, as mstrio does.
+    roots = {"report": ("v2/reports", {}, "reports"),
+             "document": ("documents", {"resolveOnly": True}, "documents"),
+             "dossier": ("dossiers", {"resolveOnly": True}, "documents")}
+    create_root, create_body, prompt_root = roots[content["type"]]
+    created = _body(session.post(f"/{create_root}/{content['id']}/instances", json=create_body),
+                    "create instance")
+    instance_id = created.get("instanceId") or created.get("mid")
+    if not instance_id:
+        raise ValueError(f"create instance: no instance id in {created}")
+
+    exported = {p.get("key"): p for p in prompts}
+    instance_path = f"/{prompt_root}/{content['id']}/instances/{instance_id}"
+    answered: set[str] = set()
+    for _ in range(10):
+        open_prompts = _body(session.get(f"{instance_path}/prompts", params={"closed": "false"}),
+                             "list open prompts")
+        open_prompts = [p for p in open_prompts or [] if p.get("key") not in answered]
+        if not open_prompts:
+            return instance_id
+        body = []
+        for prompt in open_prompts:
+            entry = {"key": prompt.get("key"), "id": prompt.get("id"), "type": prompt.get("type")}
+            source = exported.get(prompt.get("key"), {})
+            if source.get("answers") is not None:
+                # Includes an empty answer: an optional prompt left blank on the
+                # source, which may have no default to fall back to
+                entry["answers"] = source["answers"]
+            else:
+                entry["useDefault"] = True
+            body.append(entry)
+            answered.add(prompt.get("key"))
+        response = session.put(f"{instance_path}/prompts/answers", json={"prompts": body})
+        logger.debug("PUT prompts/answers {cid}: {status}", cid=content["id"],
+                     status=response.status_code)
+        _body(response, "answer prompts")
+    raise ValueError("answer prompts: prompts still open after 10 rounds")
 
 
 def export_body(sub: dict, contents: list[dict], schedule_ids: list[str], owner_id: str,
@@ -927,7 +967,7 @@ def process_export(session, sub: dict, existing: set[str], lookups: dict, folder
     instance_id = None
     if prompts:
         try:
-            instance_id = answered_instance(conn, contents[0], prompts)
+            instance_id = answered_instance(session, contents[0], prompts)
         except Exception as exc:  # noqa: BLE001
             return result("prompted", f"could not answer prompts, not created: {exc}")
 
