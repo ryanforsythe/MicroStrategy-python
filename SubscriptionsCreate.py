@@ -803,7 +803,9 @@ def answered_instance(conn, content: dict, prompts: list[dict]) -> str:
     # By keyword: the second positional is id on Report, but name on Document
     source_class = {"report": Report, "document": Document, "dossier": Dashboard}[content["type"]]
     source = source_class(conn, id=content["id"])
-    answers = [Prompt(connection=conn, id=p.get("id"), key=p.get("key"), type=p.get("type"),
+    # No connection: with one, Prompt fetches the prompt as its own object, and an
+    # embedded prompt has none (ERR004); before 11.4.0600 it raises instead
+    answers = [Prompt(id=p.get("id"), key=p.get("key"), type=p.get("type"),
                       answers=p.get("answers") if _has_answer(p) else None,
                       use_default=not _has_answer(p)) for p in prompts]
     if not source.answer_prompts(answers, force=True):
