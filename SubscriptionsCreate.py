@@ -119,7 +119,7 @@ from mstrio.distribution_services.subscription.dynamic_recipient_list import (
 )
 from mstrio.modeling.prompt import Prompt
 from mstrio.object_management import full_search
-from mstrio.project_objects import Document, Report
+from mstrio.project_objects import Dashboard, Document, Report
 from mstrio.users_and_groups import User, list_user_groups, list_users
 from mstrio.utils.helper import is_dashboard
 
@@ -800,7 +800,9 @@ def export_content(sub: dict, session, folders: dict) -> tuple[list[dict], list[
 
 def answered_instance(conn, content: dict, prompts: list[dict]) -> str:
     """Answer the prompts on an instance of the content; its id goes in the POST."""
-    source = (Report if content["type"] == "report" else Document)(conn, content["id"])
+    # By keyword: the second positional is id on Report, but name on Document
+    source_class = {"report": Report, "document": Document, "dossier": Dashboard}[content["type"]]
+    source = source_class(conn, id=content["id"])
     answers = [Prompt(connection=conn, id=p.get("id"), key=p.get("key"), type=p.get("type"),
                       answers=p.get("answers") if _has_answer(p) else None,
                       use_default=not _has_answer(p)) for p in prompts]
